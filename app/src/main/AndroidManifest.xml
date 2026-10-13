@@ -23,6 +23,14 @@
     <!-- Issue 2: without this declaration, on Android 11+ (API 30+) intent.resolveActivity()
          returns null even when a handler is installed, so intent:// and external-scheme
          navigations die silently. Also restores camera-app discovery for the file chooser. -->
+            <package android:name="com.google.android.googlequicksearchbox" />
+        <package android:name="com.google.android.apps.maps" />
+        <package android:name="com.google.android.apps.tachyon" />
+        <package android:name="com.google.android.apps.photos" />
+        <package android:name="com.google.android.gm" />
+        <package android:name="com.google.android.calendar" />
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.google.android.apps.docs" />
     <queries>
         <intent>
             <action android:name="android.intent.action.VIEW" />
