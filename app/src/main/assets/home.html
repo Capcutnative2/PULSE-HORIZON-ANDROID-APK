@@ -361,6 +361,15 @@ function load(){
   }catch(e){}
   if(!state.tiles) state.tiles = JSON.parse(JSON.stringify(DEFAULT_TILES));
   if(state.tiles.length > MAX_TILES) state.tiles = state.tiles.slice(0, MAX_TILES);
+  try{
+    if(a && a.getIcons){
+      var ic = a.getIcons();
+      if(ic){
+        var parsed = JSON.parse(ic);
+        if(parsed && typeof parsed === 'object') PH_ICONS = parsed;
+      }
+    }
+  }catch(e){}
 }
 function save(){
   var json = JSON.stringify(state);
@@ -446,8 +455,6 @@ function faviconUrls(site, file){
        Google apps installed on this device. Real, permanent, offline. */
     if(PH_ICONS[host]) local.push(PH_ICONS[host]);
     if(file) local.push('icons/' + file);
-    local.push('icons/' + host + '.png');
-    local.push('icons/' + host + '.webp');
 
     var svc = [
       'https://www.google.com/s2/favicons?sz=64&domain=' + host,
@@ -618,7 +625,15 @@ function renderSheetList(){
 document.getElementById('searchForm').addEventListener('submit', function(ev){
   ev.preventDefault(); submitQuery();
 });
-document.getElementById('accountBtn').onclick = function(){ go('https://accounts.google.com/'); };
+var GOOGLE_ACCOUNT_CHOOSER_URL = 'https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fmyaccount.google.com%2F';
+function openAccountChooser(){
+  var a = getAndroid();
+  if(a && typeof a.openAccountChooser === 'function'){
+    try{ a.openAccountChooser(); return; }catch(e){}
+  }
+  go(GOOGLE_ACCOUNT_CHOOSER_URL);
+}
+document.getElementById('accountBtn').onclick = openAccountChooser;
 document.getElementById('sheetCancel').onclick = closeSheet;
 document.getElementById('sheetAdd').onclick = addTile;
 sheet.addEventListener('click', function(ev){ if(ev.target === sheet) closeSheet(); });

@@ -619,6 +619,34 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 fetchHomeIcons(getHostsFromSavedShortcuts())
             }
         }
+        @JavascriptInterface
+        fun getIcons(): String {
+            return try {
+                val iconDir = File(filesDir, "homeicons")
+                val out = org.json.JSONObject()
+                val targetHosts = getHostsFromSavedShortcuts()
+                for (h in targetHosts) {
+                    val cached = File(iconDir, "$h.png")
+                    if (cached.exists() && cached.length() > 0L) {
+                        out.put(h, dataUri(cached.readBytes()))
+                    } else {
+                        val fromApp = appIconFor(h)
+                        if (fromApp != null) {
+                            if (!iconDir.exists()) iconDir.mkdirs()
+                            cached.writeBytes(fromApp)
+                            out.put(h, dataUri(fromApp))
+                        }
+                    }
+                }
+                out.toString()
+            } catch (_: Exception) { "{}" }
+        }
+        @JavascriptInterface
+        fun openAccountChooser() {
+            runOnUiThread {
+                loadInput("https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fmyaccount.google.com%2F")
+            }
+        }
     }
 
     private fun getHostsFromSavedShortcuts(): List<String> {
@@ -1780,6 +1808,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             // paints only its loading spinner and then never renders).
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 // v120: hand the home page the real icons of the Google apps
                 // installed on this device (see injectAppIcons below).
                 if (url != null && url.contains("android_asset/home.html")) injectHomeIcons()
@@ -1907,6 +1936,32 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                 val url = request?.url ?: return null
                 val host = url.host ?: ""
+
+                val urlStr = url.toString()
+                if (urlStr.startsWith("file:///android_asset/icons/")) {
+                    val fileName = urlStr.substringAfter("file:///android_asset/icons/").substringBefore("?").substringBefore("#")
+                    val iconHost = fileName.removeSuffix(".png").removeSuffix(".webp").removeSuffix(".ico")
+                    try {
+                        val stream = assets.open("icons/$fileName")
+                        return WebResourceResponse("image/png", null, stream)
+                    } catch (_: Exception) {}
+                    try {
+                        val cached = File(File(filesDir, "homeicons"), "$iconHost.png")
+                        if (cached.exists() && cached.length() > 0L) {
+                            return WebResourceResponse("image/png", null, java.io.FileInputStream(cached))
+                        }
+                    } catch (_: Exception) {}
+                    try {
+                        val fromApp = appIconFor(iconHost)
+                        if (fromApp != null && fromApp.isNotEmpty()) {
+                            val iconDir = File(filesDir, "homeicons")
+                            if (!iconDir.exists()) iconDir.mkdirs()
+                            File(iconDir, "$iconHost.png").writeBytes(fromApp)
+                            return WebResourceResponse("image/png", null, java.io.ByteArrayInputStream(fromApp))
+                        }
+                    } catch (_: Exception) {}
+                    return WebResourceResponse("image/png", "UTF-8", 404, "Not Found", null, java.io.ByteArrayInputStream(ByteArray(0)))
+                }
 
                 if (adBlockEnabled && blockedDomains.any { host.contains(it) }) {
                     blockedCount++
