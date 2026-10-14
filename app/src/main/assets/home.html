@@ -252,10 +252,14 @@ body::before{
    LOGIC — every feature. The design does not touch this.
    ============================================================ */
 
-/* The app hands us its icons and remembers our shortcuts (see AndroidHome
-   in MainActivity). Without it - e.g. in a plain browser - everything still
-   works, just with the fetch chain and localStorage. */
-var ANDROID = (typeof AndroidHome !== 'undefined') ? AndroidHome : null;
+/* Dynamic bridge resolution: never cache a stale null on startup */
+function getAndroid(){
+  try{
+    if(typeof AndroidHome !== 'undefined' && AndroidHome) return AndroidHome;
+    if(window.AndroidHome) return window.AndroidHome;
+  }catch(e){}
+  return null;
+}
 var MAX_TILES = 10;
 
 var PH_ICONS = {};
@@ -270,7 +274,12 @@ function renderDebug(){
     if(v === 'app' || v === 'web' || v === 'cached') ok++;
     else bad.push(host + ' \u2192 ' + v);
   }
-  el.textContent = total ? ('icons ' + ok + '/' + total + (bad.length ? '  \u00b7  ' + bad.join('  \u00b7  ') : '')) : '';
+  if(total > 0){
+    el.textContent = 'icons ' + ok + '/' + total + (bad.length ? '  \u00b7  ' + bad.join('  \u00b7  ') : '');
+  } else {
+    var count = (state && state.tiles) ? state.tiles.length : 0;
+    el.textContent = 'icons: requested (' + count + ' shortcuts)';
+  }
 }
 function phSetIcons(m){ PH_ICONS = m || {}; try{ renderTiles(); renderDebug(); }catch(e){} }
 function phOneIcon(host, uri){ if(host && uri){ PH_ICONS[host] = uri; try{ renderTiles(); }catch(e){} } }
@@ -340,7 +349,8 @@ var state = {engine:'startpage', tiles:null};
 
 function load(){
   var raw = '';
-  try{ if(ANDROID && ANDROID.getTiles) raw = ANDROID.getTiles() || ''; }catch(e){}
+  var a = getAndroid();
+  try{ if(a && a.getTiles) raw = a.getTiles() || ''; }catch(e){}
   if(!raw){ try{ raw = localStorage.getItem(KEY) || ''; }catch(e){} }
   try{
     if(raw){
@@ -355,22 +365,46 @@ function load(){
 function save(){
   var json = JSON.stringify(state);
   try{ localStorage.setItem(KEY, json); }catch(e){}
-  try{ if(ANDROID && ANDROID.setTiles) ANDROID.setTiles(json); }catch(e){}
+  var a = getAndroid();
+  try{ if(a && a.setTiles) a.setTiles(json); }catch(e){}
+}
+
+function cleanHost(u){
+  if(!u) return '';
+  u = String(u).trim();
+  if(!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  try{
+    return new URL(u).hostname.toLowerCase();
+  }catch(e){
+    var m = u.match(/^https?:\/\/([^\/:]+)/i);
+    return m ? m[1].toLowerCase() : '';
+  }
 }
 
 /* the hosts this page is showing - the app asks for these */
 function phHosts(){
   var hosts = [];
-  function add(u){ try{ var host = new URL(u).hostname; if(hosts.indexOf(host) < 0) hosts.push(host); }catch(e){} }
-  state.tiles.forEach(function(t){
+  function add(u){
+    var host = cleanHost(u);
+    if(host && hosts.indexOf(host) < 0) hosts.push(host);
+  }
+  (state.tiles || []).forEach(function(t){
     if(t.folder){ (t.apps||[]).forEach(function(a){ if(a.url) add(a.url); }); }
     else if(t.url) add(t.url);
   });
   return JSON.stringify(hosts);
 }
 function askIcons(){
-  if(!(ANDROID && ANDROID.wantIcons)) return;
-  try{ ANDROID.wantIcons(phHosts()); }catch(e){}
+  var hostsJson = phHosts();
+  // 1. Dynamic Java bridge call
+  var a = getAndroid();
+  if(a && a.wantIcons){
+    try{ a.wantIcons(hostsJson); }catch(e){}
+  }
+  // 2. Guaranteed fallback channel via document.title
+  try{
+    document.title = 'PH_HOSTS:' + hostsJson;
+  }catch(e){}
 }
 function engineById(id){
   for(var i=0;i<ENGINES.length;i++) if(ENGINES[i].id===id) return ENGINES[i];
@@ -552,6 +586,7 @@ function addTile(){
   var n = document.getElementById('tName').value.trim();
   var u = document.getElementById('tUrl').value.trim();
   if(!n || !u) return;
+  if(!/^https?:\/\//i.test(u)) u = 'https://' + u;
   if(state.tiles.length >= MAX_TILES){ setHint('You can keep ' + MAX_TILES + ' shortcuts. Remove one first.'); return; }
   state.tiles.push({name:n, url:u, icon:'globe'});
   document.getElementById('tName').value = '';
@@ -571,7 +606,7 @@ function renderSheetList(){
     var x = document.createElement('button');
     x.type = 'button'; x.className = 'sx'; x.textContent = '\u00d7';
     x.setAttribute('aria-label', 'Remove ' + t.name);
-    x.onclick = function(){ state.tiles.splice(idx,1); save(); renderTiles(); renderSheetList(); };
+    x.onclick = function(){ state.tiles.splice(idx,1); save(); renderTiles(); renderSheetList(); askIcons(); };
     row.appendChild(x);
     box.appendChild(row);
   });
@@ -592,10 +627,18 @@ folderSheet.addEventListener('click', function(ev){ if(ev.target === folderSheet
 document.getElementById('termsLink').onclick = function(){ go('terms.html'); };
 document.getElementById('feedbackLink').onclick = function(){ go('feedback.html'); };
 
+/* Expose functions on window for evaluateJavascript and bridge */
+window.phHosts = phHosts;
+window.phSetIcons = phSetIcons;
+window.phDebug = phDebug;
+window.phOneIcon = phOneIcon;
+window.askIcons = askIcons;
+
 /* ---- boot ---- */
 load();
 renderEngines();
 renderTiles();
+renderDebug();
 askIcons();
 document.getElementById('q').focus();
 </script>

@@ -610,10 +610,61 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             try {
                 val arr = org.json.JSONArray(hostsJson)
                 val hosts = ArrayList<String>()
-                for (i in 0 until arr.length()) hosts.add(arr.getString(i))
-                fetchHomeIcons(hosts)
+                for (i in 0 until arr.length()) {
+                    val h = arr.getString(i).trim()
+                    if (h.isNotEmpty() && !hosts.contains(h)) hosts.add(h)
+                }
+                if (hosts.isNotEmpty()) fetchHomeIcons(hosts) else fetchHomeIcons(getHostsFromSavedShortcuts())
+            } catch (_: Exception) {
+                fetchHomeIcons(getHostsFromSavedShortcuts())
+            }
+        }
+    }
+
+    private fun getHostsFromSavedShortcuts(): List<String> {
+        val hosts = ArrayList<String>()
+        fun addHost(raw: String?) {
+            if (raw.isNullOrBlank()) return
+            val trimmed = raw.trim()
+            val uriStr = if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) "https://$trimmed" else trimmed
+            try {
+                val host = Uri.parse(uriStr).host?.lowercase()?.trim()
+                if (!host.isNullOrBlank() && !hosts.contains(host)) hosts.add(host)
             } catch (_: Exception) {}
         }
+
+        try {
+            val rawTiles = prefs.getString("home_tiles", "") ?: ""
+            if (rawTiles.isNotEmpty()) {
+                val obj = org.json.JSONObject(rawTiles)
+                val tiles = obj.optJSONArray("tiles")
+                if (tiles != null) {
+                    for (i in 0 until tiles.length()) {
+                        val tile = tiles.optJSONObject(i) ?: continue
+                        if (tile.optBoolean("folder", false)) {
+                            val apps = tile.optJSONArray("apps")
+                            if (apps != null) {
+                                for (j in 0 until apps.length()) {
+                                    val a = apps.optJSONObject(j) ?: continue
+                                    addHost(a.optString("url"))
+                                }
+                            }
+                        } else {
+                            addHost(tile.optString("url"))
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        if (hosts.isEmpty()) {
+            val defaultHosts = listOf(
+                "www.google.com", "maps.google.com", "meet.google.com", "photos.google.com",
+                "mail.google.com", "calendar.google.com", "www.youtube.com", "drive.google.com"
+            )
+            for (h in defaultHosts) if (!hosts.contains(h)) hosts.add(h)
+        }
+        return hosts
     }
 
     private val appIconPackages = mapOf(
@@ -631,24 +682,39 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         try {
             webView.evaluateJavascript("(typeof phHosts === 'function' ? phHosts() : '')") { res ->
                 try {
-                    val inner = if (res != null && res.startsWith("\"")) org.json.JSONTokener(res).nextValue() as String else ""
-                    if (inner.isEmpty()) { injectAppIcons(); return@evaluateJavascript }
-                    val arr = org.json.JSONArray(inner)
+                    val inner = if (res != null && res.startsWith("\"")) org.json.JSONTokener(res).nextValue() as String else (res ?: "")
                     val hosts = ArrayList<String>()
-                    for (i in 0 until arr.length()) hosts.add(arr.getString(i))
-                    if (hosts.isEmpty()) injectAppIcons() else fetchHomeIcons(hosts)
-                } catch (_: Exception) { try { injectAppIcons() } catch (_: Exception) {} }
+                    if (inner.isNotEmpty() && inner != "null" && inner != "[]") {
+                        try {
+                            val arr = org.json.JSONArray(inner)
+                            for (i in 0 until arr.length()) {
+                                val h = arr.getString(i).trim()
+                                if (h.isNotEmpty() && !hosts.contains(h)) hosts.add(h)
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    if (hosts.isEmpty()) {
+                        fetchHomeIcons(getHostsFromSavedShortcuts())
+                    } else {
+                        fetchHomeIcons(hosts)
+                    }
+                } catch (_: Exception) {
+                    fetchHomeIcons(getHostsFromSavedShortcuts())
+                }
             }
-        } catch (_: Exception) { try { injectAppIcons() } catch (_: Exception) {} }
+        } catch (_: Exception) {
+            fetchHomeIcons(getHostsFromSavedShortcuts())
+        }
     }
 
     private fun fetchHomeIcons(hosts: List<String>) {
         Thread {
             try {
+                val targetHosts = if (hosts.isEmpty()) getHostsFromSavedShortcuts() else hosts
                 val iconDir = File(filesDir, "homeicons"); if (!iconDir.exists()) iconDir.mkdirs()
                 val out = LinkedHashMap<String, String>()
                 val report = LinkedHashMap<String, String>()
-                for (host in hosts) {
+                for (host in targetHosts) {
                     try {
                         val cached = File(iconDir, host + ".png")
                         if (cached.exists() && cached.length() > 0L) { out[host] = dataUri(cached.readBytes()); report[host] = "cached"; continue }
@@ -660,6 +726,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                         else report[host] = "FAIL " + lastFavReason
                     } catch (e: Exception) { report[host] = "FAIL " + e.javaClass.simpleName }
                 }
+                if (report.isEmpty()) {
+                    report["status"] = "no hosts"
+                }
                 val json = org.json.JSONObject(out as Map<*, *>).toString()
                 val dbg = org.json.JSONObject(report as Map<*, *>).toString()
                 webView.post {
@@ -668,7 +737,14 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                         webView.evaluateJavascript("window.phDebug && phDebug(" + dbg + ");", null)
                     } catch (_: Exception) {}
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                webView.post {
+                    try {
+                        val dbg = org.json.JSONObject(mapOf("error" to "FAIL " + e.javaClass.simpleName)).toString()
+                        webView.evaluateJavascript("window.phDebug && phDebug(" + dbg + ");", null)
+                    } catch (_: Exception) {}
+                }
+            }
         }.start()
     }
 
@@ -1332,6 +1408,24 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
 
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onReceivedTitle(view: WebView?, title: String?) {
+                super.onReceivedTitle(view, title)
+                if (title != null && title.startsWith("PH_HOSTS:")) {
+                    val raw = title.removePrefix("PH_HOSTS:")
+                    try {
+                        val arr = org.json.JSONArray(raw)
+                        val hosts = ArrayList<String>()
+                        for (i in 0 until arr.length()) {
+                            val h = arr.getString(i).trim()
+                            if (h.isNotEmpty() && !hosts.contains(h)) hosts.add(h)
+                        }
+                        if (hosts.isNotEmpty()) fetchHomeIcons(hosts) else fetchHomeIcons(getHostsFromSavedShortcuts())
+                    } catch (_: Exception) {
+                        fetchHomeIcons(getHostsFromSavedShortcuts())
+                    }
+                }
+            }
+
             // v127: capture the icon of every page that loads - exactly how
             // Chrome gets a site's favicon. Saved to filesDir/homeicons.
             override fun onReceivedIcon(view: WebView?, icon: android.graphics.Bitmap?) {
@@ -5515,10 +5609,14 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             }
             if (out.isEmpty()) return@Thread
             val json = org.json.JSONObject(out as Map<*, *>).toString()
+            val dbg = org.json.JSONObject(out.mapValues { "app" }).toString()
             webView.post {
                 try {
                     webView.evaluateJavascript(
                         "window.phSetIcons && phSetIcons(" + json + ");", null
+                    )
+                    webView.evaluateJavascript(
+                        "window.phDebug && phDebug(" + dbg + ");", null
                     )
                 } catch (_: Exception) {
                 }
