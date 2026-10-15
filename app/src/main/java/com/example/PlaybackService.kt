@@ -10,6 +10,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.RectF
@@ -80,6 +81,15 @@ class PlaybackService : Service() {
     }
     private val barRect = RectF()
 
+    // Small fixed-size scaled bitmap for RemoteViews to strictly avoid binder transaction limits
+    private val smallVisualWidth = 48
+    private val smallVisualHeight = 24
+    private val smallVisualBitmap = Bitmap.createBitmap(smallVisualWidth, smallVisualHeight, Bitmap.Config.ARGB_8888)
+    private val smallVisualCanvas = Canvas(smallVisualBitmap)
+    private val scaleMatrix = Matrix().apply {
+        setScale(smallVisualWidth.toFloat() / visualWidth, smallVisualHeight.toFloat() / visualHeight)
+    }
+
     // Vibrant neon palette matching Pulse Horizon edge glow
     private val barWeights = floatArrayOf(0.40f, 0.75f, 1.00f, 0.85f, 0.50f)
     private val barColors = intArrayOf(
@@ -131,10 +141,14 @@ class PlaybackService : Service() {
             else -> {
                 try {
                     renderVisual()
+                } catch (_: Exception) {}
+                try {
                     startForeground(NOTIFICATION_ID, buildNotification())
                     scheduleVisualUpdates()
                 } catch (_: Exception) {
-                    stopSelf()
+                    try {
+                        startForeground(NOTIFICATION_ID, buildPlainNotification())
+                    } catch (_: Exception) {}
                 }
             }
         }
@@ -213,7 +227,7 @@ class PlaybackService : Service() {
                 .putString(MediaMetadata.METADATA_KEY_TITLE, mediaTitle)
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, mediaArtist)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, currentDurationMs)
-                .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, visualBitmap)
+                .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, smallVisualBitmap)
                 .build()
             session.setMetadata(meta)
         } catch (_: Exception) {}
@@ -254,8 +268,9 @@ class PlaybackService : Service() {
     }
 
     /**
-     * Renders a sleek 5-bar animated level meter / wave into visualBitmap.
-     * Reuses the existing Bitmap and Canvas with zero memory allocations per frame.
+     * Renders a sleek 5-bar animated level meter / wave into visualBitmap,
+     * then scales it down to smallVisualBitmap so binder transaction limits are never exceeded.
+     * Reuses the existing Bitmaps and Canvases with zero allocations per frame.
      */
     private fun renderVisual() {
         visualCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
@@ -284,6 +299,10 @@ class PlaybackService : Service() {
             visualPaint.color = barColors[i]
             visualCanvas.drawRoundRect(barRect, 6f, 6f, visualPaint)
         }
+
+        // Scale down to fixed small dimensions before setting in RemoteViews / Notification
+        smallVisualCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        smallVisualCanvas.drawBitmap(visualBitmap, scaleMatrix, null)
     }
 
     private fun updateNotification() {
@@ -291,7 +310,12 @@ class PlaybackService : Service() {
         try {
             val mgr = getSystemService(NotificationManager::class.java)
             mgr?.notify(NOTIFICATION_ID, buildNotification())
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            try {
+                val mgr = getSystemService(NotificationManager::class.java)
+                mgr?.notify(NOTIFICATION_ID, buildPlainNotification())
+            } catch (_: Exception) {}
+        }
     }
 
     private fun createChannel() {
@@ -312,6 +336,14 @@ class PlaybackService : Service() {
     }
 
     private fun buildNotification(): Notification {
+        return try {
+            buildCustomNotification()
+        } catch (_: Exception) {
+            buildPlainNotification()
+        }
+    }
+
+    private fun buildCustomNotification(): Notification {
         val open = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
         }
@@ -324,9 +356,9 @@ class PlaybackService : Service() {
         val playPausePi = getServicePendingIntent(ACTION_PLAY_PAUSE, 102)
         val nextPi = getServicePendingIntent(ACTION_NEXT, 103)
 
-        // RemoteViews custom layout with live visualizer
+        // RemoteViews custom layout with scaled-down live visualizer
         val rv = RemoteViews(packageName, R.layout.notification_media_custom).apply {
-            setImageViewBitmap(R.id.notif_visual, visualBitmap)
+            setImageViewBitmap(R.id.notif_visual, smallVisualBitmap)
             setTextViewText(R.id.notif_title, mediaTitle)
             setTextViewText(R.id.notif_artist, mediaArtist)
             setImageViewResource(
@@ -339,7 +371,7 @@ class PlaybackService : Service() {
         }
 
         val rvBig = RemoteViews(packageName, R.layout.notification_media_custom_big).apply {
-            setImageViewBitmap(R.id.notif_big_visual, visualBitmap)
+            setImageViewBitmap(R.id.notif_big_visual, smallVisualBitmap)
             setTextViewText(R.id.notif_big_title, mediaTitle)
             setTextViewText(R.id.notif_big_artist, mediaArtist)
             setImageViewResource(
@@ -359,7 +391,7 @@ class PlaybackService : Service() {
         b.setContentTitle(mediaTitle)
             .setContentText(mediaArtist)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setLargeIcon(visualBitmap)
+            .setLargeIcon(smallVisualBitmap)
             .setContentIntent(pi)
             .setOngoing(isPlaying)
             .setCustomContentView(rv)
@@ -375,6 +407,66 @@ class PlaybackService : Service() {
         }
 
         // Standard notification actions (Previous, Play/Pause, Next)
+        b.addAction(
+            Notification.Action.Builder(
+                Icon.createWithResource(this, android.R.drawable.ic_media_previous),
+                "Previous",
+                prevPi
+            ).build()
+        )
+        b.addAction(
+            Notification.Action.Builder(
+                Icon.createWithResource(
+                    this,
+                    if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+                ),
+                if (isPlaying) "Pause" else "Play",
+                playPausePi
+            ).build()
+        )
+        b.addAction(
+            Notification.Action.Builder(
+                Icon.createWithResource(this, android.R.drawable.ic_media_next),
+                "Next",
+                nextPi
+            ).build()
+        )
+
+        return b.build()
+    }
+
+    private fun buildPlainNotification(): Notification {
+        val open = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val pFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        else PendingIntent.FLAG_UPDATE_CURRENT
+        val pi = PendingIntent.getActivity(this, 0, open, pFlags)
+
+        val prevPi = getServicePendingIntent(ACTION_PREV, 101)
+        val playPausePi = getServicePendingIntent(ACTION_PLAY_PAUSE, 102)
+        val nextPi = getServicePendingIntent(ACTION_NEXT, 103)
+
+        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            Notification.Builder(this, CHANNEL_ID)
+        else
+            @Suppress("DEPRECATION") Notification.Builder(this)
+
+        b.setContentTitle(mediaTitle)
+            .setContentText(mediaArtist)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(pi)
+            .setOngoing(isPlaying)
+
+        val session = mediaSession
+        if (session != null) {
+            val mediaStyle = Notification.MediaStyle()
+                .setMediaSession(session.sessionToken)
+                .setShowActionsInCompactView(0, 1, 2)
+            b.setStyle(mediaStyle)
+        }
+
         b.addAction(
             Notification.Action.Builder(
                 Icon.createWithResource(this, android.R.drawable.ic_media_previous),

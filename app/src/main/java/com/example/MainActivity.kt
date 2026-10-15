@@ -182,6 +182,8 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private var bgMusicEnabled = false
     private var musicAnimEnabled = false
     private var serviceRunning = false
+    private var isAppInForeground = false
+    private var accountChooserActive = false
 
     // v104: PiP Mini Video Player & MediaSession sync
     // v116: PiP is OFF. It never worked for a WebView, and entering it hid
@@ -649,6 +651,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         @JavascriptInterface
         fun openAccountChooser() {
             runOnUiThread {
+                accountChooserActive = true
                 loadInput("https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fmyaccount.google.com%2F")
             }
         }
@@ -1291,19 +1294,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         applyStrictEngineSettings()
         registerDocumentStartHooks()
         registerNetworkRecovery()
-        // v54: first launch -> the terms page on the feedback website
-        // (terms + checkbox + "Get Started" -> google.com). The app opens it
-        // with ?welcome=1 exactly once and remembers; every later start goes
-        // straight to the homepage. Normal visits to the same site (via the
-        // Help & Feedback button) show the feedback section instead.
         val firstRunPrefs = getSharedPreferences("pulse_horizon", MODE_PRIVATE)
-        val isFirstRun = !firstRunPrefs.getBoolean("terms_accepted", false)
-        if (isFirstRun) firstRunPrefs.edit().putBoolean("terms_accepted", true).apply()
-        if (isFirstRun) {
-            webView.loadUrl(termsUrl)
-        } else {
-            webView.loadUrl(homeUrl)
-        }
+        firstRunPrefs.edit().putBoolean("terms_accepted", true).apply()
+        webView.loadUrl(homeUrl)
     }
 
     private fun setupWindowInsets() {
@@ -1802,6 +1795,14 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                if (accountChooserActive && url != null && url.contains("myaccount.google.com")) {
+                    accountChooserActive = false
+                    view?.loadUrl(homeUrl)
+                    return
+                }
+                if (url != null && url.contains("accounts.google.com/AccountChooser")) {
+                    accountChooserActive = true
+                }
                 // A new navigation is under way — reset the offline-failure flag.
                 mainFrameFailedOffline = false
                 // v135: the home page is a local file - showing
@@ -1882,6 +1883,17 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 var url = request?.url?.toString() ?: return false
+
+                if (url.contains("myaccount.google.com")) {
+                    if (accountChooserActive) {
+                        accountChooserActive = false
+                        view?.loadUrl(homeUrl)
+                        return true
+                    }
+                }
+                if (url.contains("accounts.google.com/AccountChooser")) {
+                    accountChooserActive = true
+                }
 
                 // v138: the home page's tab screen drives the real tabs.
                 if (url.startsWith("pulse://tab/")) {
@@ -4804,17 +4816,17 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     }
 
     private fun syncPlaybackService() {
-        if (bgMusicEnabled && mediaPlaying && !isFinishing) startPlaybackService()
-        else stopPlaybackService()
+        if (bgMusicEnabled && mediaPlaying && !isFinishing) {
+            if (isAppInForeground) {
+                startPlaybackService()
+            }
+        } else {
+            stopPlaybackService()
+        }
     }
 
     private fun startPlaybackService() {
-        // v116: THE NOTIFICATION BUG. There used to be an
-        // "if (serviceRunning) return" guard here, and that flag was only
-        // cleared by stopPlaybackService(). If Android killed the service on
-        // its own, this app still believed it was running and NEVER started it
-        // again - which is exactly why the notification vanished and would not
-        // come back. Now we simply re-assert it every time it is wanted.
+        if (!isAppInForeground) return
         try {
             startForegroundService(Intent(this, PlaybackService::class.java))
             serviceRunning = true
@@ -5541,7 +5553,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                             }
                         } catch (_: Exception) {
                         }
-                        syncPlaybackService()
+                        startPlaybackService()
                     }
                     )
                 } else {
@@ -5614,6 +5626,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         val clean = input.trim()
         val target = when {
             clean.startsWith("http://") || clean.startsWith("https://") -> clean
+            clean.startsWith("file://") -> clean
             clean.contains(".") && !clean.contains(" ") -> "https://$clean"
             else -> "https://www.google.com/search?q=" + Uri.encode(clean)
         }
@@ -5622,8 +5635,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
     override fun onResume() {
         super.onResume()
+        isAppInForeground = true
         webView.onResume()
         webView.resumeTimers()
+        if (bgMusicEnabled) {
+            startPlaybackService()
+        }
         // v69: keep an eye on whether the page is playing anything.
         webView.removeCallbacks(mediaPoll)
         webView.postDelayed(mediaPoll, 1500L)
@@ -5635,14 +5652,15 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
     override fun onPause() {
         super.onPause()
+        isAppInForeground = false
         webView.removeCallbacks(mediaPoll)
         // v103: our own Music mode must obey the Background-music switch.
         // With it OFF, leaving the app stops the music - no background audio.
-        if (!bgMusicEnabled) musicStop()
-        // v119: THE DELAY. The service used to be started only by the 1-second
-        // poll, and the poll is stopped right here - so if you left before it
-        // had fired, the notification arrived late or not at all. Now we
-        // assert the service at the exact moment you leave.
+        if (!bgMusicEnabled) {
+            musicStop()
+            stopPlaybackService()
+        }
+        // v119: assert service state
         syncPlaybackService()
         // v83: Background music keeps audio alive.
         if (bgMusicEnabled && mediaPlaying) return

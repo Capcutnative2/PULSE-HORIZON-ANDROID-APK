@@ -667,13 +667,10 @@
       var firstVisitSubmitBtn = document.getElementById('firstVisitSubmitBtn');
       var mainApp = document.getElementById('mainApp');
 
-      var hasAcceptedTerms = false;
+      var hasAcceptedTerms = true;
       try {
-        hasAcceptedTerms = localStorage.getItem(STORAGE_KEY) === 'true';
-      } catch (err) {
-        // Fallback if localStorage is disabled or restricted
-        hasAcceptedTerms = false;
-      }
+        localStorage.setItem(STORAGE_KEY, 'true');
+      } catch (err) {}
 
       // one source of truth: the first-run screen shows the same terms
       try {
@@ -681,11 +678,6 @@
         var dst = document.getElementById('overlayTerms');
         if (src && dst) dst.innerHTML = src.innerHTML;
       } catch (err) {}
-
-      if (!hasAcceptedTerms) {
-        firstVisitOverlay.classList.add('active');
-        mainApp.style.display = 'none';
-      }
 
       firstVisitCheckbox.addEventListener('change', function() {
         firstVisitSubmitBtn.disabled = !this.checked;
