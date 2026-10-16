@@ -84,7 +84,6 @@ import java.net.URI
 import java.net.URL
 import java.nio.charset.Charset
 import android.annotation.TargetApi
-import android.content.ClipData
 import android.content.ClipboardManager
 
 class MainActivity : ComponentActivity(), ComponentCallbacks2 {
@@ -546,6 +545,45 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
     }
 
+    private val qrScanLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val dataString = result.data?.dataString ?: result.data?.getStringExtra("SCAN_RESULT")
+            if (!dataString.isNullOrEmpty()) {
+                loadInput(dataString)
+            } else {
+                Toast.makeText(this, "QR scanned successfully", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun startQrScan() {
+        try {
+            val intent = Intent("com.google.zxing.client.android.SCAN").apply {
+                putExtra("SCAN_MODE", "QR_CODE_MODE")
+            }
+            qrScanLauncher.launch(intent)
+        } catch (_: Exception) {
+            try {
+                val intent = Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE)
+                qrScanLauncher.launch(intent)
+            } catch (e: Exception) {
+                Toast.makeText(this, "QR Scanner not available", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun newTabWithUrl(url: String) {
+        syncActiveTab()
+        tabs.add(TabRecord(url, url, false, autoHideBar))
+        activeTab = tabs.size - 1
+        renderTabs()
+        applyDeskMode(false)
+        applyAutoHideNow()
+        webView.loadUrl(url)
+    }
+
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -659,6 +697,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             runOnUiThread {
                 accountChooserActive = true
                 loadInput("https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fmyaccount.google.com%2F")
+            }
+        }
+        @JavascriptInterface
+        fun openQrScanner() {
+            runOnUiThread {
+                startQrScan()
             }
         }
     }
@@ -1163,18 +1207,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(28, 0, 28, 0)
             setOnClickListener {
-                // On the home page, open the page's own tab screen - the one
-                // the design draws, and the one the number belongs to.
-                val onHome = try {
-                    webView.url?.startsWith("file:///android_asset/") == true
-                } catch (_: Exception) { false }
-                if (onHome) {
-                    try {
-                        webView.evaluateJavascript(
-                            "try{ if (window.openTabSwitcher) openTabSwitcher(); }catch(e){}", null
-                        )
-                    } catch (_: Exception) {}
-                } else showTabManager()
+                openVisualTabSwitcher()
             }
         }
         topBar.addView(tabCountBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
@@ -1201,11 +1234,32 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             // keeps its own selection/copy behaviour.
             setOnLongClickListener {
                 val t = try { (it as? WebView)?.hitTestResult?.type ?: 0 } catch (_: Exception) { 0 }
+                val extra = try { (it as? WebView)?.hitTestResult?.extra } catch (_: Exception) { null }
+                val onImage = t == WebView.HitTestResult.IMAGE_TYPE || t == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
                 val onContent = t == WebView.HitTestResult.SRC_ANCHOR_TYPE ||
-                        t == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE ||
-                        t == WebView.HitTestResult.IMAGE_TYPE ||
+                        onImage ||
                         t == WebView.HitTestResult.EDIT_TEXT_TYPE
-                if (onContent) {
+
+                if (onImage && !extra.isNullOrEmpty()) {
+                    val options = arrayOf("Open image in new tab", "Save image", "Copy image URL")
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Image options")
+                        .setItems(options) { _, which ->
+                            when (which) {
+                                0 -> newTabWithUrl(extra)
+                                1 -> downloadMediaDirect(extra, null)
+                                2 -> {
+                                    try {
+                                        val cm = getSystemService(ClipboardManager::class.java)
+                                        cm?.setPrimaryClip(ClipData.newPlainText("Image URL", extra))
+                                        Toast.makeText(applicationContext, "Image URL copied", Toast.LENGTH_SHORT).show()
+                                    } catch (_: Exception) {}
+                                }
+                            }
+                        }
+                        .show()
+                    true
+                } else if (onContent) {
                     false
                 } else {
                     AlertDialog.Builder(this@MainActivity)
@@ -1281,6 +1335,19 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
+        )
+        reloadIndicator = ReloadAnimationView(this).apply {
+            visibility = View.GONE
+        }
+        glowLayer.addView(
+            reloadIndicator,
+            FrameLayout.LayoutParams(
+                (42f * resources.displayMetrics.density).toInt(),
+                (42f * resources.displayMetrics.density).toInt(),
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            ).apply {
+                topMargin = (56f * resources.displayMetrics.density).toInt()
+            }
         )
         setContentView(glowLayer)
         ViewCompat.requestApplyInsets(rootLayout)
@@ -1804,6 +1871,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
 
         webView.webViewClient = object : WebViewClient() {
+            override fun onSafeBrowsingHit(view: WebView, request: android.webkit.WebResourceRequest, threatType: Int, callback: android.webkit.SafeBrowsingResponse) {
+                callback.backToSafety(true)
+                Toast.makeText(this@MainActivity, "Blocked dangerous website for your safety", Toast.LENGTH_LONG).show()
+            }
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 if (accountChooserActive && url != null && url.contains("myaccount.google.com")) {
@@ -4408,6 +4479,109 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         } catch (_: Exception) {}
     }
 
+    private fun openVisualTabSwitcher() {
+        syncActiveTab()
+        if (tabs.isEmpty()) tabs.add(TabRecord(homeUrl, "New tab"))
+        val dialog = AlertDialog.Builder(this, dialogTheme()).create()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colBg)
+            setPadding(32, 32, 32, 32)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 24)
+        }
+        val title = TextView(this).apply {
+            text = "Open Tabs (${tabs.size})"
+            textSize = 18f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(colText)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val newTabBtn = Button(this).apply {
+            text = "+ New Tab"
+            setTextColor(Color.WHITE)
+            setBackgroundColor(colAccent)
+            setOnClickListener {
+                dialog.dismiss()
+                newTab()
+            }
+        }
+        val closeBtn = Button(this).apply {
+            text = "✕"
+            textSize = 18f
+            setTextColor(colText)
+            setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener { dialog.dismiss() }
+        }
+        header.addView(title)
+        header.addView(newTabBtn)
+        header.addView(closeBtn)
+        root.addView(header)
+
+        val scrollView = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (420 * resources.displayMetrics.density).toInt())
+        }
+        val grid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        tabs.forEachIndexed { index, tab ->
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(24, 24, 24, 24)
+                setBackgroundColor(if (index == activeTab) colSurface else Color.parseColor("#1E293B"))
+                val params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                params.setMargins(0, 0, 0, 16)
+                layoutParams = params
+                isClickable = true
+                setOnClickListener {
+                    dialog.dismiss()
+                    switchToTab(index)
+                }
+            }
+            val rowTop = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val tabTitle = TextView(this).apply {
+                text = tab.title.ifBlank { tab.url }
+                textSize = 15f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(colText)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                maxLines = 1
+            }
+            val tabClose = Button(this).apply {
+                text = "×"
+                textSize = 18f
+                setTextColor(Color.RED)
+                setBackgroundColor(Color.TRANSPARENT)
+                setOnClickListener {
+                    dialog.dismiss()
+                    closeTab(index)
+                }
+            }
+            rowTop.addView(tabTitle)
+            rowTop.addView(tabClose)
+            card.addView(rowTop)
+
+            val tabUrl = TextView(this).apply {
+                text = tab.url
+                textSize = 12f
+                setTextColor(colDim)
+                maxLines = 1
+            }
+            card.addView(tabUrl)
+            grid.addView(card)
+        }
+        scrollView.addView(grid)
+        root.addView(scrollView)
+        dialog.setView(root)
+        dialog.show()
+    }
+
     // ---------------- v67: THREE-DOT MENU ----------------
     // v117: the menu restored - a logo AFTER each name, the URL actions, the
     // theme and the terms link, with the icons breathing.
@@ -4415,7 +4589,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         val labels = arrayOf(
             "Settings", "Downloads", "Bookmark this page", "Bookmarks", "Music",
             "Copy link", "Share", "Open in new tab", "Desktop site",
-            "Theme: " + themeModeLabel(), "Terms & Conditions"
+            "Theme: " + themeModeLabel(), "Safe Browsing: Active", "Terms & Conditions"
         )
         val icons = intArrayOf(
             android.R.drawable.ic_menu_preferences,
@@ -4428,6 +4602,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             android.R.drawable.ic_menu_more,
             android.R.drawable.ic_menu_set_as,
             android.R.drawable.ic_menu_day,
+            android.R.drawable.ic_menu_view,
             android.R.drawable.ic_menu_info_details
         )
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -4469,7 +4644,8 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     7 -> openInNewTab()
                     8 -> toggleDesktop()
                     9 -> pickTheme()
-                    10 -> openTerms()
+                    10 -> Toast.makeText(this, "Safe Browsing: Active & Protecting against malware/phishing", Toast.LENGTH_LONG).show()
+                    11 -> openTerms()
                 }
             }
             col.addView(row)
