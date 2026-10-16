@@ -83,6 +83,9 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.nio.charset.Charset
+import android.annotation.TargetApi
+import android.content.ClipData
+import android.content.ClipboardManager
 
 class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
@@ -141,6 +144,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
     // --- v85: ad/tracker blocking is now switchable, and counted ---
     private var adBlockEnabled = true
+    private var pullToRefreshEnabled = true
+    private var safeBrowsingEnabled = true
+    private lateinit var reloadIndicator: ReloadAnimationView
 
     // v101: Music mode plays the file ITSELF - our own decoder + AudioTrack.
     // Why: Android's Visualizer API is gated behind RECORD_AUDIO, so anything
@@ -1049,7 +1055,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             // zero extra RAM, nothing runs in the background.
             setOnLongClickListener {
                 val current = try { webView.url ?: urlBar.text.toString() } catch (_: Exception) { urlBar.text.toString() }
-                val options = arrayOf("Reload", "Copy URL", "Share URL", "Paste and go", "Help & Feedback")
+                val options = arrayOf("Reload", "Hard reload", "Copy URL", "Share URL", "Paste and go", "Help & Feedback")
                 AlertDialog.Builder(this@MainActivity)
                     .setTitle("URL options")
                     .setItems(options) { _, which ->
@@ -1059,13 +1065,16 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                                 try { webView.reload() } catch (_: Exception) {}
                             }
                             1 -> {
+                                hardReload()
+                            }
+                            2 -> {
                                 try {
                                     val cm = getSystemService(android.content.ClipboardManager::class.java)
                                     cm?.setPrimaryClip(ClipData.newPlainText("URL", current))
                                     Toast.makeText(applicationContext, "URL copied", Toast.LENGTH_SHORT).show()
                                 } catch (_: Exception) {}
                             }
-                            2 -> {
+                            3 -> {
                                 try {
                                     val send = Intent(Intent.ACTION_SEND).apply {
                                         type = "text/plain"
@@ -1074,7 +1083,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                                     startActivity(Intent.createChooser(send, "Share URL"))
                                 } catch (_: Exception) {}
                             }
-                            3 -> {
+                            4 -> {
                                 try {
                                     val cm = getSystemService(android.content.ClipboardManager::class.java)
                                     val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString()?.trim() ?: ""
@@ -1086,7 +1095,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                                     }
                                 } catch (_: Exception) {}
                             }
-                            4 -> {
+                            5 -> {
                                 // v52: Help & Feedback — opens the feedback page
                                 // hosted on your Google account. Only works after
                                 // the backend is deployed and feedbackUrl is set.
@@ -1213,6 +1222,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 }
             }
         }
+        attachWebViewPullToRefresh(webView)
 
         tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1277,6 +1287,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
         autoHideBar = prefs.getBoolean("auto_hide_bar", true)
         adBlockEnabled = prefs.getBoolean("ad_block", true)
+        pullToRefreshEnabled = prefs.getBoolean("pull_hard_reload", true)
         loadBookmarks()
         // v69/v73: every media feature starts OFF unless the user switched it on.
         musicAnimEnabled = prefs.getBoolean("music_anim", false)
@@ -2079,6 +2090,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                         }
                     }
                     rootLayout.addView(webView)
+                    attachWebViewPullToRefresh(webView)
                     applyStrictEngineSettings()
                     registerDocumentStartHooks()
                     webView.loadUrl(lastUrl)
@@ -5566,7 +5578,19 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
 
 
+        val pullReloadBox = CheckBox(this).apply {
+            text = "Pull down from top to hard reload"
+            isChecked = pullToRefreshEnabled
+            setTextColor(colText)
+            setPadding(0, 12, 0, 12)
+            setOnCheckedChangeListener { _, c ->
+                pullToRefreshEnabled = c
+                prefs.edit().putBoolean("pull_hard_reload", c).apply()
+            }
+        }
+
         box.addView(autoHide)
+        box.addView(pullReloadBox)
         box.addView(animBox)
         box.addView(blockBox)
         box.addView(blockedInfo)
@@ -5620,6 +5644,88 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             cleanChromiumCache(File(applicationInfo.dataDir, "app_webview"))
         } catch (_: Exception) {}
         Toast.makeText(applicationContext, "Cache cleared", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun hardReload() {
+        try {
+            Toast.makeText(this, "Hard reloading...", Toast.LENGTH_SHORT).show()
+            webView.clearCache(true)
+            webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            webView.reload()
+            webView.postDelayed({
+                try {
+                    webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
+                } catch (_: Exception) {}
+            }, 3500)
+        } catch (_: Exception) {
+            try { webView.reload() } catch (_: Exception) {}
+        }
+    }
+
+    private fun attachWebViewPullToRefresh(target: WebView) {
+        var startY = 0f
+        var startX = 0f
+        var isDraggingDown = false
+        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        val triggerDistance = (resources.displayMetrics.density * 130).coerceAtLeast(180f)
+
+        target.setOnTouchListener { _, event ->
+            if (!pullToRefreshEnabled) {
+                return@setOnTouchListener false
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    startY = event.rawY
+                    startX = event.rawX
+                    isDraggingDown = false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (target.scrollY > 0) {
+                        startY = event.rawY
+                        startX = event.rawX
+                        if (isDraggingDown) {
+                            progressBar.visibility = View.GONE
+                            progressBar.progress = 0
+                            isDraggingDown = false
+                        }
+                    } else {
+                        val dy = event.rawY - startY
+                        val dx = Math.abs(event.rawX - startX)
+                        if (dy > touchSlop && dy > dx * 1.2f) {
+                            isDraggingDown = true
+                            val fraction = ((dy - touchSlop) / triggerDistance).coerceIn(0f, 1f)
+                            progressBar.visibility = View.VISIBLE
+                            progressBar.progress = (fraction * 100).toInt()
+                        } else if (dy <= 0 && isDraggingDown) {
+                            progressBar.visibility = View.GONE
+                            progressBar.progress = 0
+                            isDraggingDown = false
+                        }
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val dy = event.rawY - startY
+                    val dx = Math.abs(event.rawX - startX)
+                    if (isDraggingDown && target.scrollY <= 0 && dy >= triggerDistance && dy > dx) {
+                        progressBar.visibility = View.VISIBLE
+                        progressBar.isIndeterminate = true
+                        hardReload()
+                        target.postDelayed({
+                            try {
+                                progressBar.isIndeterminate = false
+                                progressBar.visibility = View.GONE
+                                progressBar.progress = 0
+                            } catch (_: Exception) {}
+                        }, 1200)
+                    } else if (isDraggingDown) {
+                        progressBar.visibility = View.GONE
+                        progressBar.progress = 0
+                    }
+                    isDraggingDown = false
+                }
+            }
+            false
+        }
     }
 
     private fun loadInput(input: String) {
