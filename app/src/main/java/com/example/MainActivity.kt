@@ -1181,7 +1181,15 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(26, 0, 20, 0)
             setOnClickListener {
-                try { webView.loadUrl(homeUrl) } catch (_: Exception) {}
+                try {
+                    syncActiveTab()
+                    if (tabs.isNotEmpty()) {
+                        val i = activeTab.coerceIn(0, tabs.size - 1)
+                        tabs[i].url = homeUrl
+                        tabs[i].title = "New tab"
+                    }
+                    webView.loadUrl(homeUrl)
+                } catch (_: Exception) {}
             }
         }
         topBar.addView(homeBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
@@ -1473,6 +1481,11 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
         s.offscreenPreRaster = false
         s.mediaPlaybackRequiresUserGesture = true
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.START_SAFE_BROWSING)) {
+                WebViewCompat.startSafeBrowsing(this) { _ -> }
+            }
+        } catch (_: Exception) {}
         // Session HTTP cache (user-approved): the cache lives on DISK, so the
         // RAM footprint is only a small in-memory index (well under 1 MB) —
         // the renderer, the trim-purge and the exit-wipe all stay unchanged.
@@ -1872,8 +1885,14 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onSafeBrowsingHit(view: WebView, request: android.webkit.WebResourceRequest, threatType: Int, callback: android.webkit.SafeBrowsingResponse) {
-                callback.backToSafety(true)
-                Toast.makeText(this@MainActivity, "Blocked dangerous website for your safety", Toast.LENGTH_LONG).show()
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                        callback.backToSafety(true)
+                    } else {
+                        callback.proceed(false)
+                    }
+                } catch (_: Exception) {}
+                Toast.makeText(this@MainActivity, "⚠️ Safe Browsing blocked malicious site / phishing attempt", Toast.LENGTH_LONG).show()
             }
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
@@ -5131,23 +5150,104 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             Toast.makeText(applicationContext, "No bookmarks yet", Toast.LENGTH_SHORT).show()
             return
         }
-        val names = bookmarks.map { it.title }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Bookmarks")
-            .setItems(names) { _, which ->
-                try {
-                    val u = bookmarks[which].url
-                    if (tabs.isNotEmpty()) {
-                        val i = activeTab.coerceIn(0, tabs.size - 1)
-                        tabs[i].url = u
-                    }
-                    webView.loadUrl(u)
-                } catch (_: Exception) {
+        val dialog = AlertDialog.Builder(this, dialogTheme()).create()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colBg)
+            setPadding(36, 36, 36, 36)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 24)
+        }
+        val title = TextView(this).apply {
+            text = "Bookmarks (${bookmarks.size})"
+            textSize = 18f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(colText)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val closeBtn = Button(this).apply {
+            text = "✕"
+            textSize = 18f
+            setTextColor(colText)
+            setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener { dialog.dismiss() }
+        }
+        header.addView(title)
+        header.addView(closeBtn)
+        root.addView(header)
+
+        val scrollView = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (420 * resources.displayMetrics.density).toInt())
+        }
+        val grid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        bookmarks.forEachIndexed { index, bm ->
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(24, 20, 24, 20)
+                setBackgroundColor(colSurface)
+                val params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                params.setMargins(0, 0, 0, 16)
+                layoutParams = params
+                isClickable = true
+                setOnClickListener {
+                    dialog.dismiss()
+                    try {
+                        if (tabs.isNotEmpty()) {
+                            val i = activeTab.coerceIn(0, tabs.size - 1)
+                            tabs[i].url = bm.url
+                            tabs[i].title = bm.title
+                        }
+                        webView.loadUrl(bm.url)
+                    } catch (_: Exception) {}
                 }
             }
-            .setNeutralButton("Remove") { _, _ -> removeBookmarkPicker() }
-            .setNegativeButton("Close", null)
-            .show()
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val bmTitle = TextView(this).apply {
+                text = bm.title
+                textSize = 15f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(colText)
+                maxLines = 1
+            }
+            val bmUrl = TextView(this).apply {
+                text = bm.url
+                textSize = 12f
+                setTextColor(colDim)
+                maxLines = 1
+            }
+            textCol.addView(bmTitle)
+            textCol.addView(bmUrl)
+            card.addView(textCol)
+
+            val delBtn = Button(this).apply {
+                text = "🗑"
+                textSize = 16f
+                setTextColor(Color.RED)
+                setBackgroundColor(Color.TRANSPARENT)
+                setOnClickListener {
+                    dialog.dismiss()
+                    bookmarks.removeAt(index)
+                    saveBookmarks()
+                    Toast.makeText(applicationContext, "Bookmark removed", Toast.LENGTH_SHORT).show()
+                    showBookmarks()
+                }
+            }
+            card.addView(delBtn)
+            grid.addView(card)
+        }
+        scrollView.addView(grid)
+        root.addView(scrollView)
+        dialog.setView(root)
+        dialog.show()
     }
 
     private fun removeBookmarkPicker() {
