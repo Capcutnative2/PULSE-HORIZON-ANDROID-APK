@@ -196,7 +196,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private var bgMusicEnabled = false
     private var musicAnimEnabled = false
     private var serviceRunning = false
-    private var isAppInForeground = false
+    @Volatile var isAppInForeground = false
     private var accountChooserActive = false
     // v142: true when the account flow started from the home screen, so we
     // know to bring the user back to the home screen and not to Google.
@@ -424,9 +424,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             if (isFinishing) return
             probeMediaPlaying { res ->
                 val kind = res.kind
-                val anyPlaying = kind > 0 || musicDecoding
-                val isMusic = kind == 1 || musicDecoding
+                val isCurrentlyPlaying = (kind > 0 && !res.isPaused) || musicDecoding
+                val isMusic = (kind == 1) || musicDecoding
                 val isVideo = (kind == 2)
+                val hasMedia = (kind > 0) || musicDecoding
 
                 isVideoPlaying = isVideo
                 if (isVideo) {
@@ -439,33 +440,36 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     }
                 }
 
-                if (anyPlaying != mediaPlaying || isMusic != musicPlaying) {
-                    mediaPlaying = anyPlaying
+                if (isCurrentlyPlaying != mediaPlaying || isMusic != musicPlaying) {
+                    mediaPlaying = isCurrentlyPlaying
                     musicPlaying = isMusic
-                    syncPlaybackService()
                     updateEdgeGlow()
                 }
 
-                if (isMusic) {
-                    lastMediaPosMs = (res.currentTime * 1000L).toLong()
-                    lastMediaDurMs = (res.duration * 1000L).toLong()
+                if (hasMedia) {
+                    if (res.currentTime > 0 || res.duration > 0) {
+                        lastMediaPosMs = (res.currentTime * 1000L).toLong()
+                        lastMediaDurMs = (res.duration * 1000L).toLong()
+                    }
                     if (res.title.isNotBlank()) lastMediaTitle = res.title
-                    PlaybackService.instance?.updatePlaybackState(
-                        playing = true,
-                        posMs = lastMediaPosMs,
-                        durMs = lastMediaDurMs,
-                        title = lastMediaTitle
-                    )
+
+                    if (bgMusicEnabled && !isFinishing) {
+                        if (serviceRunning || PlaybackService.instance != null) {
+                            PlaybackService.instance?.updatePlaybackState(
+                                playing = isCurrentlyPlaying,
+                                posMs = lastMediaPosMs,
+                                durMs = lastMediaDurMs,
+                                title = lastMediaTitle
+                            )
+                        } else if (isCurrentlyPlaying) {
+                            startPlaybackService()
+                        }
+                    }
                 } else if (!musicDecoding) {
-                    PlaybackService.instance?.updatePlaybackState(
-                        playing = false,
-                        posMs = 0L,
-                        durMs = 0L,
-                        title = ""
-                    )
+                    stopPlaybackService()
                 }
             }
-            if (isAppInForeground || (bgMusicEnabled && isAnyMusicPlaying())) {
+            if (isAppInForeground || (bgMusicEnabled && hasActiveTrack())) {
                 webView.postDelayed(this, 1000L)
             }
         }
@@ -4982,36 +4986,35 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     "    }catch(_){}" +
                     "  }" +
                     "}catch(_){}" +
-                    "var music=false, vid=false, vidPlaying=false;" +
+                    "var music=false, vid=false, vidPlaying=false, musicPlaying=false;" +
                     "var vw=0, vh=0, cur=0, dur=0;" +
                     "for(var i=0;i<m.length;i++){" +
                     "  var e=m[i];" +
+                    "  if(e.ended)continue;" +
                     "  var isAudioTag=(e.tagName.toLowerCase()==='audio');" +
                     "  var hasRealVideo=(e.videoWidth>0&&e.videoHeight>0&&e.offsetWidth>0&&e.offsetHeight>0);" +
-                    "  if(!e.paused&&!e.ended&&!e.muted&&(e.volume===undefined||e.volume>0)){" +
+                    "  var isMusicTag=isAudioTag||(e.videoWidth||0)===0||(e.videoHeight||0)===0;" +
+                    "  var playing=(!e.paused&&!e.ended&&!e.muted&&(e.volume===undefined||e.volume>0));" +
+                    "  if(playing){" +
                     "    if(hasRealVideo){" +
-                    "      vid=true;" +
-                    "      vidPlaying=true;" +
-                    "      vw=e.videoWidth||0;" +
-                    "      vh=e.videoHeight||0;" +
-                    "      cur=e.currentTime||0;" +
-                    "      dur=isFinite(e.duration)?e.duration:0;" +
-                    "    }else if(isAudioTag||(e.videoWidth||0)===0||(e.videoHeight||0)===0){" +
-                    "      music=true;" +
-                    "      cur=e.currentTime||0;" +
-                    "      dur=isFinite(e.duration)?e.duration:0;" +
+                    "      vid=true;vidPlaying=true;" +
+                    "      vw=e.videoWidth||0;vh=e.videoHeight||0;cur=e.currentTime||0;dur=isFinite(e.duration)?e.duration:0;" +
+                    "    }else if(isMusicTag){" +
+                    "      music=true;musicPlaying=true;" +
+                    "      cur=e.currentTime||0;dur=isFinite(e.duration)?e.duration:0;" +
                     "    }" +
-                    "  }else if(hasRealVideo&&!vid){" +
-                    "    vw=e.videoWidth||0;" +
-                    "    vh=e.videoHeight||0;" +
-                    "    cur=e.currentTime||0;" +
-                    "    dur=isFinite(e.duration)?e.duration:0;" +
+                    "  }else if(e.currentTime>0||e.duration>0||e.readyState>=2||e.currentSrc||e.src){" +
+                    "    if(hasRealVideo&&!vid){" +
+                    "      vid=true;vw=e.videoWidth||0;vh=e.videoHeight||0;cur=e.currentTime||0;dur=isFinite(e.duration)?e.duration:0;" +
+                    "    }else if(isMusicTag&&!music){" +
+                    "      music=true;cur=e.currentTime||0;dur=isFinite(e.duration)?e.duration:0;" +
+                    "    }" +
                     "  }" +
                     "}" +
                     "var kind=vid?2:(music?1:0);" +
-                    "var paused=vid?(vidPlaying?0:1):(music?0:1);" +
+                    "var paused=vid?(!vidPlaying):(!musicPlaying);" +
                     "var t=document.title||'';" +
-                    "return kind+';'+paused+';'+cur.toFixed(2)+';'+dur.toFixed(2)+';'+vw+';'+vh+';'+encodeURIComponent(t);" +
+                    "return kind+';'+(paused?1:0)+';'+cur.toFixed(2)+';'+dur.toFixed(2)+';'+vw+';'+vh+';'+encodeURIComponent(t);" +
                     "}catch(e){return '0;1;0;0;0;0;';}})()"
             ) { raw ->
                 val str = raw?.replace("\"", "")?.trim() ?: "0;1;0;0;0;0;"
@@ -5248,18 +5251,26 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
     private fun isAnyMusicPlaying(): Boolean = (musicPlaying || mediaPlaying || musicDecoding)
 
+    private fun hasActiveTrack(): Boolean = (isAnyMusicPlaying() || (serviceRunning && PlaybackService.instance != null))
+
     private fun syncPlaybackService() {
         if (isFinishing || !bgMusicEnabled) {
             stopPlaybackService()
             return
         }
         val isMusicPlaying = isAnyMusicPlaying()
-        if (!isMusicPlaying) {
-            // If no music playing still the feature is on it will not launch any service
+        if (isMusicPlaying) {
+            if (PlaybackService.instance != null) {
+                if (!isAppInForeground) {
+                    PlaybackService.instance?.showNotification()
+                } else {
+                    PlaybackService.instance?.hideNotification()
+                }
+            } else {
+                startPlaybackService()
+            }
+        } else if (!hasActiveTrack()) {
             stopPlaybackService()
-        } else {
-            // When there is playing music, the service runs and displays the notification permanently
-            startPlaybackService()
         }
     }
 
@@ -6307,10 +6318,11 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         isAppInForeground = true
         webView.onResume()
         webView.resumeTimers()
-        syncPlaybackService()
+        // Going from bg to fg: hide notification while user is inside the app
+        PlaybackService.instance?.hideNotification()
         // v69: keep an eye on whether the page is playing anything.
         webView.removeCallbacks(mediaPoll)
-        webView.postDelayed(mediaPoll, 1500L)
+        webView.postDelayed(mediaPoll, 1000L)
         // v116: re-assert the glow every time we come back. The glow was only
         // refreshed when the play state CHANGED, so anything that hid it (like
         // entering PiP) left it hidden for good.
@@ -6332,12 +6344,17 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             return
         }
         // Background music is enabled:
-        // Service runs in background when there is playing music; stops or does not launch if no music
-        syncPlaybackService()
-        if (isAnyMusicPlaying()) {
+        // When going to bg, if active track exists, immediately show notification with zero delay!
+        if (hasActiveTrack()) {
+            if (PlaybackService.instance != null) {
+                PlaybackService.instance?.showNotification()
+            } else {
+                startPlaybackService()
+            }
             webView.removeCallbacks(mediaPoll)
-            webView.postDelayed(mediaPoll, 1500L)
+            webView.postDelayed(mediaPoll, 1000L)
         } else {
+            stopPlaybackService()
             webView.removeCallbacks(mediaPoll)
         }
     }

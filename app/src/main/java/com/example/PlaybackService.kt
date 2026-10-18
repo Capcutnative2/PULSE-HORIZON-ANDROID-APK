@@ -139,20 +139,44 @@ class PlaybackService : Service() {
                 mediaSession?.controller?.transportControls?.skipToNext()
             }
             else -> {
-                try {
-                    renderVisual()
-                } catch (_: Exception) {}
-                try {
-                    startForeground(NOTIFICATION_ID, buildNotification())
-                    scheduleVisualUpdates()
-                } catch (_: Exception) {
-                    try {
-                        startForeground(NOTIFICATION_ID, buildPlainNotification())
-                    } catch (_: Exception) {}
+                showNotification()
+                if (MainActivity.instance?.isAppInForeground == true) {
+                    hideNotification()
                 }
             }
         }
         return START_NOT_STICKY
+    }
+
+    @Volatile var isNotificationVisible = true
+
+    fun hideNotification() {
+        if (!isNotificationVisible) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            isNotificationVisible = false
+        } catch (_: Exception) {}
+    }
+
+    fun showNotification() {
+        try {
+            renderVisual()
+            startForeground(NOTIFICATION_ID, buildNotification())
+            isNotificationVisible = true
+            if (isPlaying) {
+                scheduleVisualUpdates()
+            }
+        } catch (_: Exception) {
+            try {
+                startForeground(NOTIFICATION_ID, buildPlainNotification())
+                isNotificationVisible = true
+            } catch (_: Exception) {}
+        }
     }
 
     private fun setupMediaSession() {
@@ -306,7 +330,7 @@ class PlaybackService : Service() {
     }
 
     private fun updateNotification() {
-        if (!isRunning) return
+        if (!isRunning || !isNotificationVisible) return
         try {
             val mgr = getSystemService(NotificationManager::class.java)
             mgr?.notify(NOTIFICATION_ID, buildNotification())
