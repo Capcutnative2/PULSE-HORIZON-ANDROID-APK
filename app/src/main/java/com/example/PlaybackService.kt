@@ -393,7 +393,7 @@ class PlaybackService : Service() {
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setLargeIcon(smallVisualBitmap)
             .setContentIntent(pi)
-            .setOngoing(isPlaying)
+            .setOngoing(true)
             .setCustomContentView(rv)
             .setCustomBigContentView(rvBig)
 
@@ -457,7 +457,7 @@ class PlaybackService : Service() {
             .setContentText(mediaArtist)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(pi)
-            .setOngoing(isPlaying)
+            .setOngoing(true)
 
         val session = mediaSession
         if (session != null) {

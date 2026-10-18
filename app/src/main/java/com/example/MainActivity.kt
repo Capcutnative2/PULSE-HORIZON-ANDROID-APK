@@ -5258,13 +5258,8 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             // If no music playing still the feature is on it will not launch any service
             stopPlaybackService()
         } else {
-            // The service will run in background when there is playing music
-            if (!isAppInForeground) {
-                startPlaybackService()
-            } else {
-                // When app runs in foreground, no background service is launched
-                stopPlaybackService()
-            }
+            // When there is playing music, the service runs and displays the notification permanently
+            startPlaybackService()
         }
     }
 
@@ -6312,8 +6307,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         isAppInForeground = true
         webView.onResume()
         webView.resumeTimers()
-        // When app is in foreground, no background service should be running
-        stopPlaybackService()
+        syncPlaybackService()
         // v69: keep an eye on whether the page is playing anything.
         webView.removeCallbacks(mediaPoll)
         webView.postDelayed(mediaPoll, 1500L)
