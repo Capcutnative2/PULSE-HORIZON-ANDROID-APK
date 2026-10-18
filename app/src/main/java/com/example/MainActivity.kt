@@ -465,7 +465,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     )
                 }
             }
-            webView.postDelayed(this, 1000L)
+            if (isAppInForeground || (bgMusicEnabled && isAnyMusicPlaying())) {
+                webView.postDelayed(this, 1000L)
+            }
         }
     }
 
@@ -5244,52 +5246,44 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             .show()
     }
 
+    private fun isAnyMusicPlaying(): Boolean = (musicPlaying || mediaPlaying || musicDecoding)
+
     private fun syncPlaybackService() {
-        // v144: THE NOTIFICATION BUG, FIXED.
-        // This used to require "mediaPlaying" as well. That flag comes from the
-        // page reporting that it is playing audio, and a WebView cannot report
-        // that reliably. So the moment the app was opened and the page
-        // re-reported, mediaPlaying read false, this took the else branch, and
-        // the service was STOPPED - the notification vanished and never came
-        // back, because the flag stayed false.
-        //
-        // The notification now follows the user's own switch and nothing else.
-        // Background music ON means the service stays up and the notification
-        // stays visible. It stops only when the switch is turned off, or the
-        // browser is closing.
-        // v148: the service starts when MUSIC IS ACTUALLY PLAYING - not merely
-        // because the switch is on or a permission was granted. Two things can
-        // say "playing": our own decoder (reliable) and the page's report
-        // (unreliable). Either one is enough to start.
-        //
-        // It is NOT stopped on a false negative, because the page's report
-        // cannot be trusted - that is what used to make the notification vanish.
-        // It stops when the switch goes off, or the app closes.
-        // v150: start ONLY when OUR OWN decoder is playing.
-        //
-        // v148 also allowed "mediaPlaying" - the page's report. That flag is
-        // set true when our decoder starts and only the PAGE can set it false,
-        // so it sits stale-true. The result: turning the switch on and granting
-        // the notification permission started the service with nothing playing.
-        // musicPlaying is our own reliable signal, so it is the only one used.
-        if (bgMusicEnabled && !isFinishing) {
-            if (musicPlaying && isAppInForeground) startPlaybackService()
-        } else {
+        if (isFinishing || !bgMusicEnabled) {
             stopPlaybackService()
+            return
+        }
+        val isMusicPlaying = isAnyMusicPlaying()
+        if (!isMusicPlaying) {
+            // If no music playing still the feature is on it will not launch any service
+            stopPlaybackService()
+        } else {
+            // The service will run in background when there is playing music
+            if (!isAppInForeground) {
+                startPlaybackService()
+            } else {
+                // When app runs in foreground, no background service is launched
+                stopPlaybackService()
+            }
         }
     }
 
     private fun startPlaybackService() {
-        if (!isAppInForeground) return
+        if (serviceRunning || isFinishing) return
         try {
-            startForegroundService(Intent(this, PlaybackService::class.java))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(Intent(this, PlaybackService::class.java))
+            } else {
+                startService(Intent(this, PlaybackService::class.java))
+            }
             serviceRunning = true
         } catch (_: Exception) {
+            serviceRunning = false
         }
     }
 
     private fun stopPlaybackService() {
-        if (!serviceRunning) return
+        if (!serviceRunning && PlaybackService.instance == null) return
         try {
             stopService(Intent(this, PlaybackService::class.java))
         } catch (_: Exception) {
@@ -6122,7 +6116,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                             }
                         } catch (_: Exception) {
                         }
-                        startPlaybackService()
+                        syncPlaybackService()
                     }
                     )
                 } else {
@@ -6318,9 +6312,8 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         isAppInForeground = true
         webView.onResume()
         webView.resumeTimers()
-        if (bgMusicEnabled) {
-            startPlaybackService()
-        }
+        // When app is in foreground, no background service should be running
+        stopPlaybackService()
         // v69: keep an eye on whether the page is playing anything.
         webView.removeCallbacks(mediaPoll)
         webView.postDelayed(mediaPoll, 1500L)
@@ -6333,23 +6326,26 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     override fun onPause() {
         super.onPause()
         isAppInForeground = false
-        webView.removeCallbacks(mediaPoll)
         // v103: our own Music mode must obey the Background-music switch.
         // With it OFF, leaving the app stops the music - no background audio.
         if (!bgMusicEnabled) {
             musicStop()
             stopPlaybackService()
+            pausePageMedia()
+            webView.onPause()
+            webView.pauseTimers()
+            webView.removeCallbacks(mediaPoll)
+            return
         }
-        // v144: assert service state. This no longer stops the service just
-        // because we cannot tell that the page is playing.
+        // Background music is enabled:
+        // Service runs in background when there is playing music; stops or does not launch if no music
         syncPlaybackService()
-        // v83: Background music keeps audio alive.
-        if (bgMusicEnabled) return
-        // v72: the switch is OFF, so actually stop the sound. The WebView's own
-        // pause does not reliably stop HTML5 audio - we have to tell the page.
-        pausePageMedia()
-        webView.onPause()
-        webView.pauseTimers()
+        if (isAnyMusicPlaying()) {
+            webView.removeCallbacks(mediaPoll)
+            webView.postDelayed(mediaPoll, 1500L)
+        } else {
+            webView.removeCallbacks(mediaPoll)
+        }
     }
 
     override fun onUserLeaveHint() {
