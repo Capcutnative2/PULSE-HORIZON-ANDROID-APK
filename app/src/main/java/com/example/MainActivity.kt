@@ -50,6 +50,12 @@ import android.os.Environment
 import android.os.Process
 import android.provider.MediaStore
 import android.util.Base64
+import android.util.Patterns
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -620,32 +626,155 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
     }
 
-    private val qrScanLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == RESULT_OK) {
-            val dataString = result.data?.dataString ?: result.data?.getStringExtra("SCAN_RESULT")
-            if (!dataString.isNullOrEmpty()) {
-                loadInput(dataString)
-            } else {
-                Toast.makeText(this, "QR scanned successfully", Toast.LENGTH_SHORT).show()
+    private val zxingScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val scanned = result.contents
+        if (!scanned.isNullOrBlank()) {
+            handleQrScanResult(scanned)
+        }
+    }
+
+    private val cameraPermissionForQrLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            launchEmbeddedQrScanner()
+        } else {
+            Toast.makeText(this, "Camera permission needed to scan QR codes", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun launchEmbeddedQrScanner() {
+        try {
+            val options = ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt("Point camera at a QR code")
+                setCameraId(0)
+                setBeepEnabled(true)
+                setBarcodeImageEnabled(false)
+                setOrientationLocked(false)
             }
+            zxingScanLauncher.launch(options)
+        } catch (_: Exception) {
+            Toast.makeText(this, "QR Scanner not available", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun startQrScan() {
         try {
-            val intent = Intent("com.google.zxing.client.android.SCAN").apply {
-                putExtra("SCAN_MODE", "QR_CODE_MODE")
-            }
-            qrScanLauncher.launch(intent)
+            val options = GmsBarcodeScannerOptions.Builder()
+                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                .enableAutoZoom()
+                .build()
+
+            val scanner = GmsBarcodeScanning.getClient(this, options)
+            scanner.startScan()
+                .addOnSuccessListener { barcode ->
+                    val rawValue = barcode.rawValue ?: barcode.displayValue ?: ""
+                    if (rawValue.isNotBlank()) {
+                        handleQrScanResult(rawValue)
+                    }
+                }
+                .addOnCanceledListener {
+                    // User dismissed the scanner without scanning
+                }
+                .addOnFailureListener {
+                    // Fall back to embedded QR scanner
+                    fallbackToEmbeddedScanner()
+                }
         } catch (_: Exception) {
-            try {
-                val intent = Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE)
-                qrScanLauncher.launch(intent)
-            } catch (e: Exception) {
-                Toast.makeText(this, "QR Scanner not available", Toast.LENGTH_SHORT).show()
+            fallbackToEmbeddedScanner()
+        }
+    }
+
+    private fun fallbackToEmbeddedScanner() {
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            launchEmbeddedQrScanner()
+        } else {
+            cameraPermissionForQrLauncher.launch(android.Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun isWebUrl(input: String): Boolean {
+        val trimmed = input.trim()
+        if (trimmed.startsWith("http://", ignoreCase = true) ||
+            trimmed.startsWith("https://", ignoreCase = true) ||
+            trimmed.startsWith("ftp://", ignoreCase = true) ||
+            trimmed.startsWith("file://", ignoreCase = true)
+        ) {
+            return true
+        }
+        if (!trimmed.contains(" ") && trimmed.contains(".") && Patterns.WEB_URL.matcher(trimmed).matches()) {
+            return true
+        }
+        return false
+    }
+
+    private fun handleQrScanResult(rawResult: String) {
+        val content = rawResult.trim()
+        if (content.isEmpty()) return
+
+        val isUrl = isWebUrl(content)
+        val title = if (isUrl) "QR Code: Web Link" else "QR Code: Text"
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(56, 32, 56, 16)
+        }
+
+        val typeBadge = TextView(this).apply {
+            text = if (isUrl) "URL DETECTED" else "SCANNED TEXT"
+            textSize = 12f
+            setTextColor(Color.parseColor("#3AA0FF"))
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 12)
+        }
+        container.addView(typeBadge)
+
+        val textView = TextView(this).apply {
+            text = content
+            textSize = 15f
+            setTextColor(colText)
+            setTextIsSelectable(true)
+            maxLines = 10
+        }
+        val scrollView = ScrollView(this).apply {
+            addView(textView)
+        }
+        container.addView(scrollView)
+
+        val builder = AlertDialog.Builder(this, dialogTheme())
+            .setTitle(title)
+            .setView(container)
+
+        if (isUrl) {
+            builder.setPositiveButton("Open in Browser") { _, _ ->
+                loadInput(content)
             }
+            builder.setNeutralButton("Copy URL") { _, _ ->
+                copyQrText(content)
+            }
+            builder.setNegativeButton("Cancel", null)
+        } else {
+            builder.setPositiveButton("Copy") { _, _ ->
+                copyQrText(content)
+            }
+            builder.setNeutralButton("Search Web") { _, _ ->
+                loadInput(content)
+            }
+            builder.setNegativeButton("Cancel", null)
+        }
+
+        builder.show()
+    }
+
+    private fun copyQrText(text: String) {
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("Pulse Horizon QR", text)
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+            Toast.makeText(this, "Failed to copy", Toast.LENGTH_SHORT).show()
         }
     }
 

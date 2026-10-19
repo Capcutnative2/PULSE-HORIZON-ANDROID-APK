@@ -75,5 +75,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     // v33: document-start script registration (blob-revocation race fix)
     implementation("androidx.webkit:webkit:1.11.0")
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     testImplementation(libs.junit)
 }
