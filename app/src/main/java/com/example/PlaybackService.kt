@@ -266,10 +266,10 @@ class PlaybackService : Service() {
 
         b.setContentTitle(mediaTitle)
             .setContentText(if (isPlaying) mediaArtist else "Paused")
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_media_play)
             .setLargeIcon(artBitmap)
             .setContentIntent(pi)
-            .setOngoing(true)
+            .setOngoing(isPlaying)
 
         val session = mediaSession
         if (session != null) {
@@ -281,7 +281,7 @@ class PlaybackService : Service() {
 
         b.addAction(
             Notification.Action.Builder(
-                Icon.createWithResource(this, android.R.drawable.ic_media_previous),
+                Icon.createWithResource(this, R.drawable.ic_media_prev),
                 "Previous",
                 prevPi
             ).build()
@@ -290,7 +290,7 @@ class PlaybackService : Service() {
             Notification.Action.Builder(
                 Icon.createWithResource(
                     this,
-                    if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+                    if (isPlaying) R.drawable.ic_media_pause else R.drawable.ic_media_play
                 ),
                 if (isPlaying) "Pause" else "Play",
                 playPausePi
@@ -298,7 +298,7 @@ class PlaybackService : Service() {
         )
         b.addAction(
             Notification.Action.Builder(
-                Icon.createWithResource(this, android.R.drawable.ic_media_next),
+                Icon.createWithResource(this, R.drawable.ic_media_next),
                 "Next",
                 nextPi
             ).build()
@@ -320,6 +320,16 @@ class PlaybackService : Service() {
     override fun onDestroy() {
         isRunning = false
         mainHandler.removeCallbacksAndMessages(null)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            val mgr = getSystemService(NotificationManager::class.java)
+            mgr?.cancel(NOTIFICATION_ID)
+        } catch (_: Exception) {}
         try {
             mediaSession?.isActive = false
             mediaSession?.release()

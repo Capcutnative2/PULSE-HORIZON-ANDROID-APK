@@ -34,6 +34,10 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.os.SystemClock
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -456,13 +460,15 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 if (isCurrentlyPlaying != mediaPlaying || isMusic != musicPlaying) {
                     val wasPlaying = mediaPlaying
                     mediaPlaying = isCurrentlyPlaying
-                    // v154: refresh the foreground notification so the button
-                    // shows pause while playing and play while paused.
-                    if (isAppInForeground && wasPlaying != isCurrentlyPlaying) {
-                        postForegroundNotification()
-                    }
                     musicPlaying = isMusic
                     updateEdgeGlow()
+                    if (isAppInForeground) {
+                        if (hasActiveMedia()) {
+                            postForegroundNotification()
+                        } else {
+                            cancelForegroundNotification()
+                        }
+                    }
                 }
 
                 if (hasMedia) {
@@ -473,24 +479,16 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     }
                     if (res.title.isNotBlank()) lastMediaTitle = res.title
 
-                    if (bgMusicEnabled && !isFinishing) {
-                        // v153: THE FOREGROUND BUG.
-                        // This block started the service on its own, with no
-                        // check for whether the app was in the foreground - so
-                        // it ran a service while the user was looking at the
-                        // screen. There are two places that start it; I only
-                        // fixed the other one.
-                        // Now the poll does not decide. syncPlaybackService()
-                        // does, and it is the only place that knows the
-                        // foreground: service in the background, plain
-                        // notification in the foreground, nothing when idle.
+                    if (!isFinishing) {
                         syncPlaybackService()
-                        PlaybackService.instance?.updatePlaybackState(
-                            playing = isCurrentlyPlaying,
-                            posMs = lastMediaPosMs,
-                            durMs = lastMediaDurMs,
-                            title = lastMediaTitle
-                        )
+                        if (!isAppInForeground) {
+                            PlaybackService.instance?.updatePlaybackState(
+                                playing = isCurrentlyPlaying,
+                                posMs = lastMediaPosMs,
+                                durMs = lastMediaDurMs,
+                                title = lastMediaTitle
+                            )
+                        }
                     }
                 } else {
                     hasPageMedia = false
@@ -1464,11 +1462,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         loadBookmarks()
         // v69/v73: every media feature starts OFF unless the user switched it on.
         musicAnimEnabled = prefs.getBoolean("music_anim", false)
-        // v148: the background-music switch is NEVER remembered. Whatever was
-        // stored, it comes back OFF every launch. Nothing about a background
-        // service may survive the app closing.
-        bgMusicEnabled = false
-        try { prefs.edit().putBoolean("bg_music", false).commit() } catch (_: Exception) {}
+        bgMusicEnabled = prefs.getBoolean("bg_music", true)
         pipEnabled = prefs.getBoolean("mini_video_player", true)
         instance = this
         setupPlaybackServiceCallback()
@@ -1519,6 +1513,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             android.Manifest.permission.CAMERA,
             android.Manifest.permission.RECORD_AUDIO
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             permissions.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
             permissions.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -5290,43 +5287,93 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private fun hasActiveMedia(): Boolean = (isAnyMusicPlaying() || hasPageMedia || musicDecoding)
 
     private fun syncPlaybackService() {
-        if (isFinishing || !bgMusicEnabled) {
+        if (isFinishing) {
+            cancelForegroundNotification()
             stopPlaybackService()
             return
         }
-        // v152: the service runs ONLY in the background. In the foreground the
-        // app posts a plain notification itself, with no service at all - which
-        // is the behaviour the user asked for, and the one that costs nothing.
-        if (hasActiveMedia() && !isAppInForeground) {
-            cancelForegroundNotification()
-            startPlaybackService()
-        } else if (hasActiveMedia()) {
+        if (isAppInForeground) {
+            // When music is playing on the foreground, display notification with control without running any extra service
             stopPlaybackService()
-            postForegroundNotification()
+            if (hasActiveMedia()) {
+                postForegroundNotification()
+            } else {
+                cancelForegroundNotification()
+            }
         } else {
+            // When music is running in background, cancel the foreground-only notification and run the service to keep playback alive and display notification with proper control
             cancelForegroundNotification()
-            stopPlaybackService()
+            if (bgMusicEnabled && hasActiveMedia()) {
+                startPlaybackService()
+            } else {
+                stopPlaybackService()
+            }
         }
     }
 
-    // v152: the foreground notification. Plain, minimal, no custom view - so it
-    // cannot fail on a bitmap or a layout. Same id as the service, so when the
-    // service takes over it simply replaces this one.
-    // v154: the foreground notification's controls.
-    //
-    // The service is NOT running in the foreground, so it cannot be the thing
-    // that handles the buttons. The activity has the WebView, so the buttons
-    // are broadcasts back here - which also means they work whether or not the
-    // service is up.
+    private fun handleMediaToggle() {
+        runOnUiThread {
+            if (musicDecoding) {
+                if (musicPlaying) {
+                    try { musicTrack?.pause() } catch (_: Exception) {}
+                    musicPlaying = false
+                    mediaPlaying = false
+                } else {
+                    try { musicTrack?.play() } catch (_: Exception) {}
+                    musicPlaying = true
+                    mediaPlaying = true
+                }
+                updateEdgeGlow()
+            } else {
+                if (mediaPlaying) {
+                    pausePageMedia()
+                    mediaPlaying = false
+                    musicPlaying = false
+                } else {
+                    resumePageMedia()
+                    mediaPlaying = true
+                }
+            }
+            if (isAppInForeground) {
+                postForegroundNotification()
+            } else {
+                PlaybackService.instance?.updatePlaybackState(
+                    playing = isAnyMusicPlaying(),
+                    posMs = lastMediaPosMs,
+                    durMs = lastMediaDurMs,
+                    title = if (lastMediaTitle.isNotBlank()) lastMediaTitle else "Pulse Horizon"
+                )
+            }
+        }
+    }
+
+    private fun handleMediaPrev() {
+        runOnUiThread {
+            if (musicDecoding) {
+                musicPosMs = (musicPosMs - 10000L).coerceAtLeast(0L)
+            } else {
+                seekPageMediaRelative(-10.0)
+            }
+        }
+    }
+
+    private fun handleMediaNext() {
+        runOnUiThread {
+            if (musicDecoding) {
+                musicPosMs = (musicPosMs + 10000L).coerceAtMost(musicDurMs)
+            } else {
+                seekPageMediaRelative(10.0)
+            }
+        }
+    }
+
     private val mediaControlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             try {
                 when (intent?.action) {
-                    "pulse.media.TOGGLE" -> {
-                        if (mediaPlaying) pausePageMedia() else resumePageMedia()
-                    }
-                    "pulse.media.PREV" -> seekPageMediaRelative(-10.0)
-                    "pulse.media.NEXT" -> seekPageMediaRelative(10.0)
+                    "pulse.media.TOGGLE" -> handleMediaToggle()
+                    "pulse.media.PREV" -> handleMediaPrev()
+                    "pulse.media.NEXT" -> handleMediaNext()
                 }
             } catch (_: Exception) {}
         }
@@ -5340,16 +5387,95 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         )
     } catch (_: Exception) { null }
 
+    private var fgMediaSession: MediaSession? = null
+
+    private fun setupForegroundMediaSession() {
+        if (fgMediaSession != null) return
+        try {
+            val session = MediaSession(this, "PulseHorizonForegroundSession").apply {
+                setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
+                setCallback(object : MediaSession.Callback() {
+                    override fun onPlay() {
+                        handleMediaToggle()
+                    }
+
+                    override fun onPause() {
+                        handleMediaToggle()
+                    }
+
+                    override fun onSkipToNext() {
+                        handleMediaNext()
+                    }
+
+                    override fun onSkipToPrevious() {
+                        handleMediaPrev()
+                    }
+
+                    override fun onSeekTo(pos: Long) {
+                        runOnUiThread {
+                            if (musicDecoding) {
+                                musicPosMs = pos
+                            } else {
+                                seekPageMediaAbsolute(pos / 1000.0)
+                            }
+                        }
+                    }
+                })
+            }
+            fgMediaSession = session
+        } catch (_: Exception) {}
+    }
+
+    private fun updateFgMediaSessionState() {
+        val session = fgMediaSession ?: return
+        try {
+            val isPlayingNow = isAnyMusicPlaying()
+            val state = if (isPlayingNow) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
+            val speed = if (isPlayingNow) 1.0f else 0.0f
+            val actions = PlaybackState.ACTION_PLAY or
+                    PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_PLAY_PAUSE or
+                    PlaybackState.ACTION_SKIP_TO_PREVIOUS or
+                    PlaybackState.ACTION_SKIP_TO_NEXT or
+                    PlaybackState.ACTION_SEEK_TO
+
+            val pbState = PlaybackState.Builder()
+                .setActions(actions)
+                .setState(state, lastMediaPosMs, speed, SystemClock.elapsedRealtime())
+                .build()
+
+            session.setPlaybackState(pbState)
+
+            val meta = MediaMetadata.Builder()
+                .putString(
+                    MediaMetadata.METADATA_KEY_TITLE,
+                    if (lastMediaTitle.isNotBlank()) lastMediaTitle else "Pulse Horizon"
+                )
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, if (isPlayingNow) "Playing" else "Paused")
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, lastMediaDurMs)
+                .build()
+            session.setMetadata(meta)
+        } catch (_: Exception) {}
+    }
+
     private fun postForegroundNotification() {
         try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return
+            }
             val mgr = getSystemService(android.app.NotificationManager::class.java) ?: return
-            if (mgr.getNotificationChannel("pulse_horizon_playback") == null) {
-                mgr.createNotificationChannel(
-                    android.app.NotificationChannel(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (mgr.getNotificationChannel("pulse_horizon_playback") == null) {
+                    val ch = android.app.NotificationChannel(
                         "pulse_horizon_playback", "Playback",
                         android.app.NotificationManager.IMPORTANCE_LOW
                     )
-                )
+                    ch.description = "Audio playback controls"
+                    ch.setShowBadge(false)
+                    mgr.createNotificationChannel(ch)
+                }
             }
             val openApp = try {
                 PendingIntent.getActivity(
@@ -5360,27 +5486,59 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 )
             } catch (_: Exception) { null }
 
-            val b = android.app.Notification.Builder(this, "pulse_horizon_playback")
-                .setContentTitle(lastMediaTitle.ifBlank { "Playing" })
-                .setContentText("Pulse Horizon")
+            setupForegroundMediaSession()
+            fgMediaSession?.isActive = true
+            updateFgMediaSessionState()
+
+            val isPlayingNow = isAnyMusicPlaying()
+            val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                android.app.Notification.Builder(this, "pulse_horizon_playback")
+            else
+                @Suppress("DEPRECATION") android.app.Notification.Builder(this)
+
+            b.setContentTitle(if (lastMediaTitle.isNotBlank()) lastMediaTitle else "Pulse Horizon")
+                .setContentText(if (isPlayingNow) "Playing" else "Paused")
                 .setSmallIcon(R.drawable.ic_media_play)
-                .setOngoing(true)
+                .setOngoing(isPlayingNow)
             if (openApp != null) b.setContentIntent(openApp)
-            // v155: OUR icons. The old android.R.drawable.ic_media_* set does
-            // not render on modern Android, so the notification fell back to
-            // showing the text label - which is why the buttons appeared as
-            // words. These are proper vectors in the app's own drawables.
+
+            val session = fgMediaSession
+            if (session != null) {
+                val mediaStyle = android.app.Notification.MediaStyle()
+                    .setMediaSession(session.sessionToken)
+                    .setShowActionsInCompactView(0, 1, 2)
+                b.setStyle(mediaStyle)
+            }
+
             mediaControlPi("pulse.media.PREV", 11)?.let {
-                b.addAction(R.drawable.ic_media_prev, "Back 10 seconds", it)
+                b.addAction(
+                    android.app.Notification.Action.Builder(
+                        Icon.createWithResource(this, R.drawable.ic_media_prev),
+                        "Previous",
+                        it
+                    ).build()
+                )
             }
             mediaControlPi("pulse.media.TOGGLE", 12)?.let {
                 b.addAction(
-                    if (mediaPlaying) R.drawable.ic_media_pause else R.drawable.ic_media_play,
-                    "Play or pause", it
+                    android.app.Notification.Action.Builder(
+                        Icon.createWithResource(
+                            this,
+                            if (isPlayingNow) R.drawable.ic_media_pause else R.drawable.ic_media_play
+                        ),
+                        if (isPlayingNow) "Pause" else "Play",
+                        it
+                    ).build()
                 )
             }
             mediaControlPi("pulse.media.NEXT", 13)?.let {
-                b.addAction(R.drawable.ic_media_next, "Forward 10 seconds", it)
+                b.addAction(
+                    android.app.Notification.Action.Builder(
+                        Icon.createWithResource(this, R.drawable.ic_media_next),
+                        "Next",
+                        it
+                    ).build()
+                )
             }
             mgr.notify(4711, b.build())
         } catch (_: Exception) {}
@@ -5389,23 +5547,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private fun cancelForegroundNotification() {
         try {
             getSystemService(android.app.NotificationManager::class.java)?.cancel(4711)
+            fgMediaSession?.isActive = false
         } catch (_: Exception) {}
     }
 
     private fun startPlaybackService() {
         if (isFinishing || !bgMusicEnabled) return
-        // v155: THE "NOTIFICATION SOMETIMES MISSING IN THE BACKGROUND" BUG.
-        //
-        // Android 12+ forbids starting a foreground service from the
-        // background - it throws ForegroundServiceStartNotAllowedException and
-        // the notification never appears. That is exactly what happened: the
-        // media poll runs in the background, called this, and got refused.
-        //
-        // A foreground service can only be started while the app is still in
-        // the foreground. onPause() is inside that window, so the start happens
-        // there. If we are already in the background and the service is not
-        // running, there is nothing we can legally do - so do not try.
-        if (!isAppInForeground && !serviceRunning) return
         try {
             val intent = Intent(this, PlaybackService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -6547,7 +6694,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         webView.removeCallbacks(mediaPoll)
         webView.removeCallbacks(glowRunnable)
         musicStop()
-        // v69: nothing of ours may outlive the app - stop the keep-alive.
+        try {
+            fgMediaSession?.isActive = false
+            fgMediaSession?.release()
+        } catch (_: Exception) {}
+        fgMediaSession = null
+        cancelForegroundNotification()
         stopPlaybackService()
         // v66: tabs live in memory only - drop them so nothing survives exit
         tabs.clear()
