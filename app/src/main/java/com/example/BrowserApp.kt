@@ -13,6 +13,15 @@ class BrowserApp : Application() {
             if (badSubdir.exists()) {
                 File(cacheDir, "WebView").deleteRecursively()
             }
+            // Clean up unverified or corrupted Chromium variations seed files
+            val appWebviewDir = File(dataDir, "app_webview")
+            if (appWebviewDir.exists()) {
+                appWebviewDir.listFiles()?.forEach { file ->
+                    if (file.name.startsWith("variations_seed") || file.name.startsWith("variations-seed")) {
+                        file.delete()
+                    }
+                }
+            }
         } catch (_: Exception) {}
     }
 }

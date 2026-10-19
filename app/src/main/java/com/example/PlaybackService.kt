@@ -10,7 +10,6 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.RectF
@@ -23,18 +22,15 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
-import android.widget.RemoteViews
 
 /**
- * v104: Background-music keep-alive and interactive MediaSession notification.
+ * Background-music keep-alive and permanent MediaSession notification service.
  *
  * Implements:
- *  - MediaSession with transport controls (Play, Pause, Skip, Seek) sent as media button events.
+ *  - Official MediaSession with transport controls (Play, Pause, Skip, Seek).
  *  - Standard Notification.MediaStyle with session token and live position scrubber bar.
- *  - A moving mini music visualizer (level meter / dynamic wave) rendered into a custom RemoteViews
- *    and album art using the EXACT same beat level that drives the edge glow.
- *  - Battery & rate-limit discipline: 250ms (4 FPS) update rate while playing, zero updates when paused.
- *  - Zero memory allocations per frame: single pre-allocated Bitmap, Canvas, and Paint.
+ *  - Permanent, persistent notification that does not throttle or get suppressed by Android OS.
+ *  - Stays active in low-power idle mode when paused in background so the user can resume anytime.
  */
 class PlaybackService : Service() {
 
@@ -48,7 +44,7 @@ class PlaybackService : Service() {
 
         @Volatile var instance: PlaybackService? = null
 
-        // In-process callback to MainActivity for transport controls — no broadcast receivers needed
+        // In-process callback to MainActivity for transport controls
         var mediaCallback: MediaControlCallback? = null
     }
 
@@ -71,45 +67,15 @@ class PlaybackService : Service() {
     @Volatile private var mediaTitle = "Pulse Horizon"
     @Volatile private var mediaArtist = "Audio is playing"
 
-    // Zero-allocation drawing cache for the mini level meter / wave visualizer
-    private val visualWidth = 128
-    private val visualHeight = 64
-    private val visualBitmap = Bitmap.createBitmap(visualWidth, visualHeight, Bitmap.Config.ARGB_8888)
-    private val visualCanvas = Canvas(visualBitmap)
-    private val visualPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // Small art badge for media metadata
+    private val artWidth = 64
+    private val artHeight = 64
+    private val artBitmap = Bitmap.createBitmap(artWidth, artHeight, Bitmap.Config.ARGB_8888)
+    private val artCanvas = Canvas(artBitmap)
+    private val artPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
-    private val barRect = RectF()
-
-    // Small fixed-size scaled bitmap for RemoteViews to strictly avoid binder transaction limits
-    private val smallVisualWidth = 48
-    private val smallVisualHeight = 24
-    private val smallVisualBitmap = Bitmap.createBitmap(smallVisualWidth, smallVisualHeight, Bitmap.Config.ARGB_8888)
-    private val smallVisualCanvas = Canvas(smallVisualBitmap)
-    private val scaleMatrix = Matrix().apply {
-        setScale(smallVisualWidth.toFloat() / visualWidth, smallVisualHeight.toFloat() / visualHeight)
-    }
-
-    // Vibrant neon palette matching Pulse Horizon edge glow
-    private val barWeights = floatArrayOf(0.40f, 0.75f, 1.00f, 0.85f, 0.50f)
-    private val barColors = intArrayOf(
-        Color.parseColor("#00F0FF"), // Cyan
-        Color.parseColor("#7000FF"), // Purple
-        Color.parseColor("#FF00E5"), // Neon Magenta
-        Color.parseColor("#7000FF"), // Purple
-        Color.parseColor("#00FFA3")  // Mint
-    )
-
-    // Visualizer animation timer — runs strictly at 250ms (4 FPS) to prevent Android notification throttling
-    private val visualUpdateRunnable = object : Runnable {
-        override fun run() {
-            if (isRunning && isPlaying) {
-                renderVisual()
-                updateNotification()
-                mainHandler.postDelayed(this, 250L)
-            }
-        }
-    }
+    private val artRect = RectF()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -119,13 +85,14 @@ class PlaybackService : Service() {
         isRunning = true
         createChannel()
         setupMediaSession()
+        renderArt()
+        showNotification()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         when (action) {
             ACTION_PLAY_PAUSE -> {
-                // Route button clicks through MediaSession transport controls
                 if (isPlaying) {
                     mediaSession?.controller?.transportControls?.pause()
                 } else {
@@ -138,45 +105,15 @@ class PlaybackService : Service() {
             ACTION_NEXT -> {
                 mediaSession?.controller?.transportControls?.skipToNext()
             }
-            else -> {
-                showNotification()
-                if (MainActivity.instance?.isAppInForeground == true) {
-                    hideNotification()
-                }
-            }
         }
-        return START_NOT_STICKY
-    }
-
-    @Volatile var isNotificationVisible = true
-
-    fun hideNotification() {
-        if (!isNotificationVisible) return
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            isNotificationVisible = false
-        } catch (_: Exception) {}
+        showNotification()
+        return START_STICKY
     }
 
     fun showNotification() {
         try {
-            renderVisual()
             startForeground(NOTIFICATION_ID, buildNotification())
-            isNotificationVisible = true
-            if (isPlaying) {
-                scheduleVisualUpdates()
-            }
-        } catch (_: Exception) {
-            try {
-                startForeground(NOTIFICATION_ID, buildPlainNotification())
-                isNotificationVisible = true
-            } catch (_: Exception) {}
-        }
+        } catch (_: Exception) {}
     }
 
     private fun setupMediaSession() {
@@ -188,7 +125,6 @@ class PlaybackService : Service() {
                         isPlaying = true
                         mediaCallback?.onPlay()
                         syncPlaybackState()
-                        scheduleVisualUpdates()
                         updateNotification()
                     }
 
@@ -196,8 +132,6 @@ class PlaybackService : Service() {
                         isPlaying = false
                         mediaCallback?.onPause()
                         syncPlaybackState()
-                        mainHandler.removeCallbacks(visualUpdateRunnable)
-                        renderVisual() // Render idle state once
                         updateNotification()
                     }
 
@@ -251,20 +185,19 @@ class PlaybackService : Service() {
                 .putString(MediaMetadata.METADATA_KEY_TITLE, mediaTitle)
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, mediaArtist)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, currentDurationMs)
-                .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, smallVisualBitmap)
+                .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, artBitmap)
                 .build()
             session.setMetadata(meta)
         } catch (_: Exception) {}
     }
 
-    // Called from MainActivity with the same beatLevel that drives the edge glow
     fun updateBeatLevel(beat: Float) {
         currentBeatLevel = beat.coerceIn(0f, 1f)
     }
 
-    // Called from MainActivity to keep notification in sync with page/decoder playback
     fun updatePlaybackState(playing: Boolean, posMs: Long, durMs: Long, title: String) {
         val stateChanged = (isPlaying != playing)
+        val titleChanged = (title.isNotBlank() && title != mediaTitle)
         isPlaying = playing
         currentPositionMs = posMs
         currentDurationMs = durMs
@@ -273,73 +206,27 @@ class PlaybackService : Service() {
         syncPlaybackState()
         syncMetadata()
 
-        if (stateChanged) {
-            if (isPlaying) {
-                scheduleVisualUpdates()
-            } else {
-                mainHandler.removeCallbacks(visualUpdateRunnable)
-                renderVisual()
-            }
+        if (stateChanged || titleChanged) {
             updateNotification()
         }
     }
 
-    private fun scheduleVisualUpdates() {
-        mainHandler.removeCallbacks(visualUpdateRunnable)
-        if (isRunning && isPlaying) {
-            mainHandler.post(visualUpdateRunnable)
-        }
-    }
-
-    /**
-     * Renders a sleek 5-bar animated level meter / wave into visualBitmap,
-     * then scales it down to smallVisualBitmap so binder transaction limits are never exceeded.
-     * Reuses the existing Bitmaps and Canvases with zero allocations per frame.
-     */
-    private fun renderVisual() {
-        visualCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-
-        val count = 5
-        val barW = 12f
-        val gap = 8f
-        val startX = (visualWidth - (count * barW + (count - 1) * gap)) / 2f
-        val maxH = visualHeight - 12f
-        val minH = 6f
-
-        for (i in 0 until count) {
-            val weight = barWeights[i]
-            val h = if (isPlaying) {
-                minH + (maxH - minH) * (currentBeatLevel * weight).coerceIn(0.15f, 1.0f)
-            } else {
-                minH
-            }
-
-            val left = startX + i * (barW + gap)
-            val top = visualHeight - 6f - h
-            val right = left + barW
-            val bottom = visualHeight - 6f
-
-            barRect.set(left, top, right, bottom)
-            visualPaint.color = barColors[i]
-            visualCanvas.drawRoundRect(barRect, 6f, 6f, visualPaint)
-        }
-
-        // Scale down to fixed small dimensions before setting in RemoteViews / Notification
-        smallVisualCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        smallVisualCanvas.drawBitmap(visualBitmap, scaleMatrix, null)
+    private fun renderArt() {
+        artCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        artPaint.color = Color.parseColor("#7000FF") // Neon Purple
+        artRect.set(0f, 0f, artWidth.toFloat(), artHeight.toFloat())
+        artCanvas.drawRoundRect(artRect, 16f, 16f, artPaint)
+        artPaint.color = Color.parseColor("#00F0FF") // Cyan accent
+        artRect.set(12f, 12f, (artWidth - 12).toFloat(), (artHeight - 12).toFloat())
+        artCanvas.drawRoundRect(artRect, 10f, 10f, artPaint)
     }
 
     private fun updateNotification() {
-        if (!isRunning || !isNotificationVisible) return
+        if (!isRunning) return
         try {
             val mgr = getSystemService(NotificationManager::class.java)
             mgr?.notify(NOTIFICATION_ID, buildNotification())
-        } catch (_: Exception) {
-            try {
-                val mgr = getSystemService(NotificationManager::class.java)
-                mgr?.notify(NOTIFICATION_ID, buildPlainNotification())
-            } catch (_: Exception) {}
-        }
+        } catch (_: Exception) {}
     }
 
     private fun createChannel() {
@@ -352,7 +239,7 @@ class PlaybackService : Service() {
                     "Background music",
                     NotificationManager.IMPORTANCE_LOW
                 )
-                ch.description = "Shown only while audio keeps playing in the background"
+                ch.description = "Shown while audio plays in the background"
                 ch.setShowBadge(false)
                 mgr?.createNotificationChannel(ch)
             }
@@ -360,106 +247,6 @@ class PlaybackService : Service() {
     }
 
     private fun buildNotification(): Notification {
-        return try {
-            buildCustomNotification()
-        } catch (_: Exception) {
-            buildPlainNotification()
-        }
-    }
-
-    private fun buildCustomNotification(): Notification {
-        val open = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        val pFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        else PendingIntent.FLAG_UPDATE_CURRENT
-        val pi = PendingIntent.getActivity(this, 0, open, pFlags)
-
-        val prevPi = getServicePendingIntent(ACTION_PREV, 101)
-        val playPausePi = getServicePendingIntent(ACTION_PLAY_PAUSE, 102)
-        val nextPi = getServicePendingIntent(ACTION_NEXT, 103)
-
-        // RemoteViews custom layout with scaled-down live visualizer
-        val rv = RemoteViews(packageName, R.layout.notification_media_custom).apply {
-            setImageViewBitmap(R.id.notif_visual, smallVisualBitmap)
-            setTextViewText(R.id.notif_title, mediaTitle)
-            setTextViewText(R.id.notif_artist, mediaArtist)
-            setImageViewResource(
-                R.id.notif_play_pause,
-                if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-            )
-            setOnClickPendingIntent(R.id.notif_prev, prevPi)
-            setOnClickPendingIntent(R.id.notif_play_pause, playPausePi)
-            setOnClickPendingIntent(R.id.notif_next, nextPi)
-        }
-
-        val rvBig = RemoteViews(packageName, R.layout.notification_media_custom_big).apply {
-            setImageViewBitmap(R.id.notif_big_visual, smallVisualBitmap)
-            setTextViewText(R.id.notif_big_title, mediaTitle)
-            setTextViewText(R.id.notif_big_artist, mediaArtist)
-            setImageViewResource(
-                R.id.notif_big_play_pause,
-                if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-            )
-            setOnClickPendingIntent(R.id.notif_big_prev, prevPi)
-            setOnClickPendingIntent(R.id.notif_big_play_pause, playPausePi)
-            setOnClickPendingIntent(R.id.notif_big_next, nextPi)
-        }
-
-        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            Notification.Builder(this, CHANNEL_ID)
-        else
-            @Suppress("DEPRECATION") Notification.Builder(this)
-
-        b.setContentTitle(mediaTitle)
-            .setContentText(mediaArtist)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setLargeIcon(smallVisualBitmap)
-            .setContentIntent(pi)
-            .setOngoing(true)
-            .setCustomContentView(rv)
-            .setCustomBigContentView(rvBig)
-
-        // Attach standard MediaStyle with MediaSession token for OS scrubber and lockscreen controls
-        val session = mediaSession
-        if (session != null) {
-            val mediaStyle = Notification.MediaStyle()
-                .setMediaSession(session.sessionToken)
-                .setShowActionsInCompactView(0, 1, 2)
-            b.setStyle(mediaStyle)
-        }
-
-        // Standard notification actions (Previous, Play/Pause, Next)
-        b.addAction(
-            Notification.Action.Builder(
-                Icon.createWithResource(this, android.R.drawable.ic_media_previous),
-                "Previous",
-                prevPi
-            ).build()
-        )
-        b.addAction(
-            Notification.Action.Builder(
-                Icon.createWithResource(
-                    this,
-                    if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-                ),
-                if (isPlaying) "Pause" else "Play",
-                playPausePi
-            ).build()
-        )
-        b.addAction(
-            Notification.Action.Builder(
-                Icon.createWithResource(this, android.R.drawable.ic_media_next),
-                "Next",
-                nextPi
-            ).build()
-        )
-
-        return b.build()
-    }
-
-    private fun buildPlainNotification(): Notification {
         val open = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
         }
@@ -478,8 +265,9 @@ class PlaybackService : Service() {
             @Suppress("DEPRECATION") Notification.Builder(this)
 
         b.setContentTitle(mediaTitle)
-            .setContentText(mediaArtist)
+            .setContentText(if (isPlaying) mediaArtist else "Paused")
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .setLargeIcon(artBitmap)
             .setContentIntent(pi)
             .setOngoing(true)
 

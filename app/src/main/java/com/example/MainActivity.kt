@@ -71,6 +71,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.graphics.Insets
 import androidx.webkit.WebViewCompat
@@ -447,6 +448,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 }
 
                 if (hasMedia) {
+                    hasPageMedia = true
                     if (res.currentTime > 0 || res.duration > 0) {
                         lastMediaPosMs = (res.currentTime * 1000L).toLong()
                         lastMediaDurMs = (res.duration * 1000L).toLong()
@@ -454,22 +456,25 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     if (res.title.isNotBlank()) lastMediaTitle = res.title
 
                     if (bgMusicEnabled && !isFinishing) {
-                        if (serviceRunning || PlaybackService.instance != null) {
+                        if (!serviceRunning && PlaybackService.instance == null) {
+                            startPlaybackService()
+                        } else {
                             PlaybackService.instance?.updatePlaybackState(
                                 playing = isCurrentlyPlaying,
                                 posMs = lastMediaPosMs,
                                 durMs = lastMediaDurMs,
                                 title = lastMediaTitle
                             )
-                        } else if (isCurrentlyPlaying) {
-                            startPlaybackService()
                         }
                     }
-                } else if (!musicDecoding) {
-                    stopPlaybackService()
+                } else {
+                    hasPageMedia = false
+                    if (!musicDecoding) {
+                        stopPlaybackService()
+                    }
                 }
             }
-            if (isAppInForeground || (bgMusicEnabled && hasActiveTrack())) {
+            if (isAppInForeground || (bgMusicEnabled && hasActiveMedia())) {
                 webView.postDelayed(this, 1000L)
             }
         }
@@ -1182,22 +1187,6 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             setOnFocusChangeListener { _, hasFocus ->
                 if (hasFocus) setText("")
             }
-            setOnTouchListener { v, e ->
-                if (e.action == MotionEvent.ACTION_UP) {
-                    try {
-                        val imm = v.context.getSystemService(InputMethodManager::class.java)
-                        imm?.showSoftInput(v, InputMethodManager.SHOW_IMPLICIT)
-                    } catch (_: Exception) {}
-                }
-                false // never consume — cursor placement must keep working
-            }
-
-            // v45: long-press the URL bar -> Copy / Share / Paste-and-go.
-            // All handled by Android's own clipboard and share-sheet —
-            // zero extra RAM, nothing runs in the background.
-            // v150: the tap-and-hold URL options menu is REMOVED. The address
-            // bar no longer opens anything on a long press.
-
 
             setOnEditorActionListener { _, actionId, event ->
                 if (actionId == EditorInfo.IME_ACTION_GO ||
@@ -1205,6 +1194,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 ) {
                     loadInput(text.toString())
                     clearFocus()
+                    try {
+                        WindowCompat.getInsetsController(window, this)?.hide(WindowInsetsCompat.Type.ime())
+                    } catch (_: Exception) {}
                     val imm = getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager
                     imm?.hideSoftInputFromWindow(windowToken, 0)
                     true
@@ -1451,42 +1443,24 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private fun setupWindowInsets() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { view, insets ->
-            val systemBars = insets.getInsets(
-                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime()
-            )
-            view.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
-            // v104: keep the glow inside the safe area - under the status bar,
-            // above the gesture bar, and clear of any side insets.
-            glowInner?.setPadding(
-                systemBars.left, systemBars.top, systemBars.right, systemBars.bottom
-            )
-            // v58: when the keyboard closes (Back key or focus moving into the
-            // page), the browser chrome dissolves with it. Hiding previously ran
-            // only at page-finish time, so a bar left showing on an already
-            // loaded page stayed stuck forever. Typing inside a page's own text
-            // fields is unaffected: the chrome is already hidden in that case.
-            val imeNow = insets.isVisible(WindowInsetsCompat.Type.ime())
-            imeVisible = imeNow
-            if (imeWasVisible && !imeNow) {
-                if (urlBar.hasFocus()) urlBar.clearFocus()
-                hideChrome()
-            }
-            imeWasVisible = imeNow
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            val bottom = maxOf(systemBars.bottom, ime.bottom)
+            view.setPadding(systemBars.left, systemBars.top, systemBars.right, bottom)
+            glowInner?.setPadding(systemBars.left, systemBars.top, systemBars.right, bottom)
 
-            // v71: THE KEYBOARD BUG. We have just consumed the system-bar and
-            // IME insets as padding on this view. Android's own WebView insets
-            // guide says you must then ZERO those dimensions on the object you
-            // pass down, or the WebView resizes its visual viewport a second
-            // time. That second resize makes the page see a resize event the
-            // instant the keyboard opens, the page drops focus, and the
-            // keyboard closes again - which is exactly the "appears for a
-            // tenth of a second then vanishes" you are seeing.
-            WindowInsetsCompat.Builder(insets)
-                .setInsets(
-                    WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime(),
-                    Insets.NONE
-                )
-                .build()
+            val imeNow = insets.isVisible(WindowInsetsCompat.Type.ime())
+            if (imeWasVisible && !imeNow) {
+                view.post {
+                    if (!isFinishing) {
+                        if (urlBar.hasFocus()) urlBar.clearFocus()
+                        hideChrome()
+                    }
+                }
+            }
+            imeVisible = imeNow
+            imeWasVisible = imeNow
+            WindowInsetsCompat.CONSUMED
         }
     }
 
@@ -5249,47 +5223,46 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             .show()
     }
 
+    private var hasPageMedia = false
+
     private fun isAnyMusicPlaying(): Boolean = (musicPlaying || mediaPlaying || musicDecoding)
 
-    private fun hasActiveTrack(): Boolean = (isAnyMusicPlaying() || (serviceRunning && PlaybackService.instance != null))
+    private fun hasActiveMedia(): Boolean = (isAnyMusicPlaying() || hasPageMedia || musicDecoding)
 
     private fun syncPlaybackService() {
         if (isFinishing || !bgMusicEnabled) {
             stopPlaybackService()
             return
         }
-        val isMusicPlaying = isAnyMusicPlaying()
-        if (isMusicPlaying) {
-            if (PlaybackService.instance != null) {
-                if (!isAppInForeground) {
-                    PlaybackService.instance?.showNotification()
-                } else {
-                    PlaybackService.instance?.hideNotification()
-                }
-            } else {
-                startPlaybackService()
-            }
-        } else if (!hasActiveTrack()) {
+        if (hasActiveMedia()) {
+            startPlaybackService()
+        } else {
             stopPlaybackService()
         }
     }
 
     private fun startPlaybackService() {
-        if (serviceRunning || isFinishing) return
+        if (isFinishing || !bgMusicEnabled) return
         try {
+            val intent = Intent(this, PlaybackService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(Intent(this, PlaybackService::class.java))
+                startForegroundService(intent)
             } else {
-                startService(Intent(this, PlaybackService::class.java))
+                startService(intent)
             }
             serviceRunning = true
+            PlaybackService.instance?.updatePlaybackState(
+                playing = isAnyMusicPlaying(),
+                posMs = lastMediaPosMs,
+                durMs = lastMediaDurMs,
+                title = if (lastMediaTitle.isNotBlank()) lastMediaTitle else "Pulse Horizon"
+            )
         } catch (_: Exception) {
             serviceRunning = false
         }
     }
 
     private fun stopPlaybackService() {
-        if (!serviceRunning && PlaybackService.instance == null) return
         try {
             stopService(Intent(this, PlaybackService::class.java))
         } catch (_: Exception) {
@@ -6318,22 +6291,15 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         isAppInForeground = true
         webView.onResume()
         webView.resumeTimers()
-        // Going from bg to fg: hide notification while user is inside the app
-        PlaybackService.instance?.hideNotification()
-        // v69: keep an eye on whether the page is playing anything.
+        syncPlaybackService()
         webView.removeCallbacks(mediaPoll)
-        webView.postDelayed(mediaPoll, 1000L)
-        // v116: re-assert the glow every time we come back. The glow was only
-        // refreshed when the play state CHANGED, so anything that hid it (like
-        // entering PiP) left it hidden for good.
+        webView.post(mediaPoll)
         updateEdgeGlow()
     }
 
     override fun onPause() {
         super.onPause()
         isAppInForeground = false
-        // v103: our own Music mode must obey the Background-music switch.
-        // With it OFF, leaving the app stops the music - no background audio.
         if (!bgMusicEnabled) {
             musicStop()
             stopPlaybackService()
@@ -6344,13 +6310,8 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             return
         }
         // Background music is enabled:
-        // When going to bg, if active track exists, immediately show notification with zero delay!
-        if (hasActiveTrack()) {
-            if (PlaybackService.instance != null) {
-                PlaybackService.instance?.showNotification()
-            } else {
-                startPlaybackService()
-            }
+        if (hasActiveMedia()) {
+            startPlaybackService()
             webView.removeCallbacks(mediaPoll)
             webView.postDelayed(mediaPoll, 1000L)
         } else {
