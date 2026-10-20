@@ -339,18 +339,52 @@
     }
 
     .first-visit-overlay.active {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
+      display: block;
+      overflow-y: auto;
     }
 
     .overlay-box {
       width: 100%;
       max-width: 580px;
-      margin: auto 0;
+      margin: 0 auto;
       display: flex;
       flex-direction: column;
       gap: 16px;
+      padding-bottom: 60px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      body, .first-visit-overlay {
+        background-color: #0B1120;
+        color: #F1F5F9;
+      }
+      .brand-title, .card-title, .input-label, .chips-label {
+        color: #F8FAFC;
+      }
+      .brand-sub, .field-hint {
+        color: #94A3B8;
+      }
+      .card {
+        background-color: #1E293B;
+        border-color: #334155;
+      }
+      .feature-item, .terms-item, .checkbox-text {
+        color: #CBD5E1;
+      }
+      .feature-item strong, .terms-item strong {
+        color: #F8FAFC;
+      }
+      .collapsible-content {
+        border-top-color: #334155;
+      }
+      .chevron {
+        stroke: #F8FAFC;
+      }
+      .chip-btn, .text-input, .text-area {
+        background-color: #0F172A;
+        border-color: #334155;
+        color: #F8FAFC;
+      }
     }
   </style>
 </head>
@@ -598,11 +632,11 @@
 
       <label class="checkbox-container" for="firstVisitCheckbox">
         <input type="checkbox" id="firstVisitCheckbox">
-        <span class="checkbox-text">I have read the terms</span>
+        <span class="checkbox-text" style="font-size: 15px; font-weight: 600;">I have read & agree to The terms</span>
       </label>
 
       <button type="button" class="big-button" id="firstVisitSubmitBtn" disabled>
-        Submit
+        Agree &amp; Continue
       </button>
     </div>
   </div>
@@ -617,10 +651,14 @@
       var firstVisitSubmitBtn = document.getElementById('firstVisitSubmitBtn');
       var mainApp = document.getElementById('mainApp');
 
-      var hasAcceptedTerms = true;
+      var hasAcceptedTerms = false;
       try {
-        localStorage.setItem(STORAGE_KEY, 'true');
+        hasAcceptedTerms = localStorage.getItem(STORAGE_KEY) === 'true';
       } catch (err) {}
+
+      if (!hasAcceptedTerms && firstVisitOverlay) {
+        firstVisitOverlay.classList.add('active');
+      }
 
       // one source of truth: the first-run screen shows the same terms
       try {
@@ -640,6 +678,12 @@
         } catch (e) {
           // Continue even if local storage is restricted
         }
+        try {
+          if (window.AndroidTerms && window.AndroidTerms.acceptTerms) {
+            window.AndroidTerms.acceptTerms();
+            return;
+          }
+        } catch (e) {}
         window.location.replace('https://pulse-horizon.local/start');
       });
 

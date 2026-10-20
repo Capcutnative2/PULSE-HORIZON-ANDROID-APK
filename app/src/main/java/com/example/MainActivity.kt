@@ -637,9 +637,51 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            launchEmbeddedQrScanner()
+            launchSmartQrScanner()
         } else {
             Toast.makeText(this, "Camera permission needed to scan QR codes", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun startQrScan() {
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            launchSmartQrScanner()
+        } else {
+            cameraPermissionForQrLauncher.launch(android.Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun launchSmartQrScanner() {
+        try {
+            val dialog = SmartQrScannerDialog(this) { scannedText ->
+                handleQrScanResult(scannedText)
+            }
+            dialog.show()
+        } catch (_: Exception) {
+            fallbackToGmsOrZxing()
+        }
+    }
+
+    private fun fallbackToGmsOrZxing() {
+        try {
+            val options = GmsBarcodeScannerOptions.Builder()
+                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                .enableAutoZoom()
+                .build()
+
+            val scanner = GmsBarcodeScanning.getClient(this, options)
+            scanner.startScan()
+                .addOnSuccessListener { barcode ->
+                    val rawValue = barcode.rawValue ?: barcode.displayValue ?: ""
+                    if (rawValue.isNotBlank()) {
+                        handleQrScanResult(rawValue)
+                    }
+                }
+                .addOnFailureListener {
+                    launchEmbeddedQrScanner()
+                }
+        } catch (_: Exception) {
+            launchEmbeddedQrScanner()
         }
     }
 
@@ -656,41 +698,6 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             zxingScanLauncher.launch(options)
         } catch (_: Exception) {
             Toast.makeText(this, "QR Scanner not available", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun startQrScan() {
-        try {
-            val options = GmsBarcodeScannerOptions.Builder()
-                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-                .enableAutoZoom()
-                .build()
-
-            val scanner = GmsBarcodeScanning.getClient(this, options)
-            scanner.startScan()
-                .addOnSuccessListener { barcode ->
-                    val rawValue = barcode.rawValue ?: barcode.displayValue ?: ""
-                    if (rawValue.isNotBlank()) {
-                        handleQrScanResult(rawValue)
-                    }
-                }
-                .addOnCanceledListener {
-                    // User dismissed the scanner without scanning
-                }
-                .addOnFailureListener {
-                    // Fall back to embedded QR scanner
-                    fallbackToEmbeddedScanner()
-                }
-        } catch (_: Exception) {
-            fallbackToEmbeddedScanner()
-        }
-    }
-
-    private fun fallbackToEmbeddedScanner() {
-        if (checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            launchEmbeddedQrScanner()
-        } else {
-            cameraPermissionForQrLauncher.launch(android.Manifest.permission.CAMERA)
         }
     }
 
@@ -982,6 +989,37 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 startQrScan()
             }
         }
+    }
+
+    inner class TermsBridge {
+        @JavascriptInterface
+        fun acceptTerms() {
+            runOnUiThread {
+                onTermsAccepted()
+            }
+        }
+    }
+
+    private fun isTermsAccepted(): Boolean {
+        return getSharedPreferences("pulse_horizon", MODE_PRIVATE).getBoolean("terms_accepted", false)
+    }
+
+    private fun onTermsAccepted() {
+        val firstRunPrefs = getSharedPreferences("pulse_horizon", MODE_PRIVATE)
+        firstRunPrefs.edit().putBoolean("terms_accepted", true).apply()
+
+        // Request permissions after user has read & agreed to the terms
+        checkRequiredPermissions()
+
+        // Navigate to home screen
+        if (tabs.isNotEmpty()) {
+            tabs[activeTab.coerceIn(0, tabs.size - 1)] = TabRecord(homeUrl, "New tab", false, autoHideBar)
+        } else {
+            tabs.add(TabRecord(homeUrl, "New tab", false, autoHideBar))
+            activeTab = 0
+        }
+        renderTabs()
+        webView.loadUrl(homeUrl)
     }
 
     private fun getHostsFromSavedShortcuts(): List<String> {
@@ -1390,10 +1428,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(26, 0, 20, 0)
             setOnClickListener {
-                // v149: this used to overwrite the CURRENT tab's address with
-                // the home page - so pressing Home destroyed the page you were
-                // reading. It now opens the home page in a NEW tab, so whatever
-                // you were on is still there when you go back to it.
+                if (!isTermsAccepted()) {
+                    Toast.makeText(this@MainActivity, "Please read and agree to the terms to continue", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
                 try {
                     val onHome = webView.url?.startsWith("file:///android_asset/") == true
                     if (!onHome) {
@@ -1597,17 +1635,23 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         setupPlaybackServiceCallback()
         registerPipReceiver()
         tabs.clear()
-        tabs.add(TabRecord(homeUrl, "New tab", false, autoHideBar))
-        activeTab = 0
-        renderTabs()
-
-        checkRequiredPermissions()
         applyStrictEngineSettings()
         registerDocumentStartHooks()
         registerNetworkRecovery()
-        val firstRunPrefs = getSharedPreferences("pulse_horizon", MODE_PRIVATE)
-        firstRunPrefs.edit().putBoolean("terms_accepted", true).commit()
-        webView.loadUrl(homeUrl)
+
+        val termsAccepted = isTermsAccepted()
+        if (termsAccepted) {
+            tabs.add(TabRecord(homeUrl, "New tab", false, autoHideBar))
+            activeTab = 0
+            renderTabs()
+            checkRequiredPermissions()
+            webView.loadUrl(homeUrl)
+        } else {
+            tabs.add(TabRecord(termsUrl, "Terms of Service", false, autoHideBar))
+            activeTab = 0
+            renderTabs()
+            webView.loadUrl(termsUrl)
+        }
     }
 
     private fun setupWindowInsets() {
@@ -1734,6 +1778,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
         webView.addJavascriptInterface(BlobDownloadBridge(), "AndroidBlobBridge")
         webView.addJavascriptInterface(HomeBridge(), "AndroidHome")
+        webView.addJavascriptInterface(TermsBridge(), "AndroidTerms")
 
         // v23: Gemini-style sites block their own download buttons (CSP /
         // cross-frame blobs — the v22 chain reports "site blocked the
@@ -2176,9 +2221,15 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 if (url != null && url.startsWith("file:///android_asset/")) renderTabs()
                 if (url != null && url.startsWith("file:///android_asset/")) tellHomePageTheme()
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
-                // v120: hand the home page the real icons of the Google apps
-                // installed on this device (see injectAppIcons below).
                 if (url != null && url.contains("android_asset/home.html")) injectHomeIcons()
+                if (url != null && url.contains("android_asset/terms.html")) {
+                    if (isTermsAccepted()) {
+                        view?.evaluateJavascript(
+                            "try { localStorage.setItem('pulse_horizon_terms_accepted_v1', 'true'); var ov = document.getElementById('firstVisitOverlay'); if (ov) ov.classList.remove('active'); } catch(e){}",
+                            null
+                        )
+                    }
+                }
                 // v84: we just arrived at a tab - put its scroll and typed text back
                 if (pendingRestore) {
                     pendingRestore = false
@@ -2303,7 +2354,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 // and the app loads the home page itself. file -> https is
                 // always allowed, so this route cannot be blocked.
                 if (url.startsWith("https://pulse-horizon.local/")) {
-                    view?.loadUrl(homeUrl)
+                    onTermsAccepted()
                     return true
                 }
 
