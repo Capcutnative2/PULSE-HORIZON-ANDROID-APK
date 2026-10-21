@@ -1366,6 +1366,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         // v117: the theme is decided BEFORE anything is built, and it is
         // applied IN PLACE later - never by recreating the screen.
         themeMode = prefs.getString("theme_mode", "system") ?: "system"
+        lastNightMode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
         val darkNow = when (themeMode) {
             "dark" -> true
             "light" -> false
@@ -2324,14 +2325,8 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     return true
                 }
                 if (url.startsWith("pulse://closetab/")) {
-                    // v148: the page navigated here to ask us to close a tab -
-                    // which reloads the page, so the page's own Undo toast never
-                    // appears. The app shows the undo instead, and it lasts the
-                    // ten seconds the user asked for.
                     url.removePrefix("pulse://closetab/").toIntOrNull()?.let { idx ->
-                        val removed = if (idx in tabs.indices) tabs[idx] else null
                         closeTab(idx)
-                        if (removed != null) showTabUndo(removed)
                     }
                     return true
                 }
@@ -4611,34 +4606,64 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         if (::tabCountBtn.isInitialized) {
             try { tabCountBtn.text = tabs.size.toString() } catch (_: Exception) {}
         }
-        // v139: keep the page's tab screen in step with the real tabs
+        // v139: keep the page's tab screen in step with the real tabs (with real thumbnail previews)
         try {
+            captureCurrentTabThumbnail()
             val arr = org.json.JSONArray()
             tabs.forEachIndexed { i, t ->
                 val o = org.json.JSONObject()
                 o.put("title", t.title.ifBlank { "New tab" })
                 o.put("url", t.url)
                 o.put("active", i == activeTab)
+                val thumbBytes = synchronized(tabThumbnails) { tabThumbnails[t.url] }
+                if (thumbBytes != null && thumbBytes.isNotEmpty()) {
+                    o.put("thumb", "data:image/jpeg;base64," + Base64.encodeToString(thumbBytes, Base64.NO_WRAP))
+                } else {
+                    o.put("thumb", "")
+                }
                 arr.put(o)
             }
             webView.evaluateJavascript(
                 "try{ if (window.phSetTabs) phSetTabs(" + arr.toString() + "); }catch(e){}", null
             )
         } catch (_: Exception) {}
-        // v138: the home page draws its own tab screen, so it must be told
-        // what is really open, or its list and number disagree with the browser.
+    }
+
+    // --- Group C: Bounded Thumbnail Cache for Tabs ---------------------------
+    // Stored as compressed JPEG bytes (NOT raw bitmaps) to ensure zero memory bloat.
+    // Hard cap of 8 thumbnails, small fixed 160x120 px. Oldest evicted on cap.
+    // Dropped when tab closes and when app backgrounds.
+    private val tabThumbnails = object : LinkedHashMap<String, ByteArray>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean {
+            return size > 8
+        }
+    }
+
+    private fun captureCurrentTabThumbnail() {
+        if (tabs.isEmpty() || activeTab !in tabs.indices) return
+        val active = tabs[activeTab]
+        if (active.url.isBlank() || active.url.startsWith("file:///android_asset/")) return
         try {
-            val arr = org.json.JSONArray()
-            tabs.forEachIndexed { i, t ->
-                val o = org.json.JSONObject()
-                o.put("title", t.title.ifBlank { "New tab" })
-                o.put("url", t.url)
-                o.put("active", i == activeTab)
-                arr.put(o)
+            val w = webView.width
+            val h = webView.height
+            if (w <= 0 || h <= 0) return
+
+            val thumbW = 160
+            val thumbH = 120
+            val bmp = Bitmap.createBitmap(thumbW, thumbH, Bitmap.Config.RGB_565)
+            val canvas = Canvas(bmp)
+            val scale = maxOf(thumbW.toFloat() / w.toFloat(), thumbH.toFloat() / h.toFloat())
+            canvas.scale(scale, scale)
+            webView.draw(canvas)
+
+            val out = java.io.ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 60, out)
+            bmp.recycle()
+
+            val bytes = out.toByteArray()
+            synchronized(tabThumbnails) {
+                tabThumbnails[active.url] = bytes
             }
-            webView.evaluateJavascript(
-                "try{ if (window.phSetTabs) phSetTabs(" + arr.toString() + "); }catch(e){}", null
-            )
         } catch (_: Exception) {}
     }
 
@@ -4648,6 +4673,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     // the page before a tab is discarded and put them back on return.
 
     private fun captureTabState(onDone: () -> Unit) {
+        captureCurrentTabThumbnail()
         syncActiveTab()
         try {
             webView.evaluateJavascript(
@@ -4786,7 +4812,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    setBackgroundColor(colSurface)
+                    background = GradientDrawable().apply {
+                        setColor(colSurface)
+                        cornerRadius = 24f
+                        setStroke(2, colLine)
+                    }
+                    elevation = 16f
                     // same vertical padding as the address bar -> same height
                     setPadding(28, 20, 28, 20)
                     visibility = View.GONE
@@ -4840,6 +4871,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             (bar?.tag as? TextView)?.text =
                 (removed.title.ifBlank { "That tab" }) + " closed"
             bar?.visibility = View.VISIBLE
+            bar?.bringToFront()
             undoHandler.removeCallbacks(hideUndoRunnable)
             undoHandler.postDelayed(hideUndoRunnable, 5000L)
         } catch (_: Exception) {}
@@ -4899,7 +4931,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private fun closeTab(index: Int) {
         if (index !in tabs.indices) return
         syncActiveTab()
-        tabs.removeAt(index)
+        val removed = tabs.removeAt(index)
+        synchronized(tabThumbnails) {
+            tabThumbnails.remove(removed.url)
+        }
         if (tabs.isEmpty()) {
             tabs.add(TabRecord(homeUrl, "New tab"))
             activeTab = 0
@@ -4908,6 +4943,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
         renderTabs()
         webView.loadUrl(tabs[activeTab].url.ifBlank { homeUrl })
+        showTabUndo(removed)
     }
 
     // ---------------- v68: AUTO-HIDE (per tab) ----------------
@@ -5091,11 +5127,11 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 dlg.dismiss()
                 // v130: Tabs is no longer here - it lives in the toolbar now
                 when (idx) {
-                    0 -> showSettings()
-                    1 -> showDownloads()
+                    0 -> showSettings(fromMenu = true)
+                    1 -> showDownloads(fromMenu = true)
                     2 -> addBookmark()
-                    3 -> showBookmarks()
-                    4 -> showMusic()
+                    3 -> showBookmarks(fromMenu = true)
+                    4 -> showMusic(fromMenu = true)
                     5 -> copyCurrentLink()
                     6 -> shareCurrentLink()
                     7 -> openInNewTab()
@@ -5486,7 +5522,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     }
 
     // v146: add or remove a host from the user's own block list, or allow list.
-    private fun showHostRuleEditor(isBlockList: Boolean) {
+    private fun showHostRuleEditor(isBlockList: Boolean, fromSettings: Boolean = true, originalFromMenu: Boolean = true) {
         val set = if (isBlockList) userBlockHosts else userAllowHosts
         val title = if (isBlockList) "Sites you block" else "Sites you allow"
         val input = EditText(this).apply {
@@ -5499,7 +5535,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             setPadding(40, 24, 40, 8)
             addView(input)
         }
-        AlertDialog.Builder(this, dialogTheme())
+        val builder = AlertDialog.Builder(this, dialogTheme())
             .setTitle(title)
             .setView(wrap)
             .setPositiveButton("Add") { _, _ ->
@@ -5527,8 +5563,13 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     .setNegativeButton("Cancel", null)
                     .show()
             }
-            .setNegativeButton("Close", null)
-            .show()
+        if (fromSettings) {
+            builder.setNegativeButton("Back") { _, _ -> showSettings(fromMenu = originalFromMenu) }
+            builder.setOnCancelListener { showSettings(fromMenu = originalFromMenu) }
+        } else {
+            builder.setNegativeButton("Close", null)
+        }
+        builder.show()
     }
 
     private var hasPageMedia = false
@@ -5672,6 +5713,15 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                         }
                     }
                 })
+                val openApp = PendingIntent.getActivity(
+                    this@MainActivity, 21,
+                    Intent(this@MainActivity, MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                    else PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                try { setSessionActivity(openApp) } catch (_: Exception) {}
             }
             fgMediaSession = session
         } catch (_: Exception) {}
@@ -5841,8 +5891,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
     }
 
-    // ---------------- v85: DOWNLOADS ----------------
-    private fun showDownloads() {
+    private fun showDownloads(fromMenu: Boolean = true) {
         try {
             val dm = getSystemService(android.app.DownloadManager::class.java)
             val q = android.app.DownloadManager.Query()
@@ -5859,10 +5908,18 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             }
             c.close()
             if (names.isEmpty()) {
-                Toast.makeText(applicationContext, "No downloads yet", Toast.LENGTH_SHORT).show()
+                val b = AlertDialog.Builder(this)
+                    .setTitle("Downloads")
+                    .setMessage("No downloads yet")
+                    .setPositiveButton("Done", null)
+                if (fromMenu) {
+                    b.setNegativeButton("Back") { _, _ -> showMenu() }
+                    b.setOnCancelListener { showMenu() }
+                }
+                b.show()
                 return
             }
-            AlertDialog.Builder(this)
+            val b = AlertDialog.Builder(this)
                 .setTitle("Downloads")
                 .setItems(names.toTypedArray()) { _, which ->
                     try {
@@ -5877,8 +5934,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                         Toast.makeText(applicationContext, "Cannot open that file", Toast.LENGTH_SHORT).show()
                     }
                 }
-                .setNegativeButton("Close", null)
-                .show()
+                .setPositiveButton("Done", null)
+            if (fromMenu) {
+                b.setNegativeButton("Back") { _, _ -> showMenu() }
+                b.setOnCancelListener { showMenu() }
+            }
+            b.show()
         } catch (_: Exception) {
             Toast.makeText(applicationContext, "Could not read downloads", Toast.LENGTH_SHORT).show()
         }
@@ -5926,12 +5987,23 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
     }
 
-    private fun showBookmarks() {
+    private fun showBookmarks(fromMenu: Boolean = true) {
         if (bookmarks.isEmpty()) {
-            Toast.makeText(applicationContext, "No bookmarks yet", Toast.LENGTH_SHORT).show()
+            val b = AlertDialog.Builder(this, dialogTheme())
+                .setTitle("Bookmarks")
+                .setMessage("No bookmarks yet")
+                .setPositiveButton("Done", null)
+            if (fromMenu) {
+                b.setNegativeButton("Back") { _, _ -> showMenu() }
+                b.setOnCancelListener { showMenu() }
+            }
+            b.show()
             return
         }
         val dialog = AlertDialog.Builder(this, dialogTheme()).create()
+        if (fromMenu) {
+            dialog.setOnCancelListener { showMenu() }
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(colBg)
@@ -5941,6 +6013,19 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 0, 0, 24)
+        }
+        if (fromMenu) {
+            val backBtn = Button(this).apply {
+                text = "←"
+                textSize = 18f
+                setTextColor(colAccent)
+                setBackgroundColor(Color.TRANSPARENT)
+                setOnClickListener {
+                    dialog.dismiss()
+                    showMenu()
+                }
+            }
+            header.addView(backBtn)
         }
         val title = TextView(this).apply {
             text = "Bookmarks (${bookmarks.size})"
@@ -5988,6 +6073,31 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     } catch (_: Exception) {}
                 }
             }
+            // Group C: Site icon thumbnail on bookmark card
+            val iconBadge = TextView(this).apply {
+                val host = try { Uri.parse(bm.url).host ?: "" } catch (_: Exception) { "" }
+                val initial = if (host.isNotBlank()) {
+                    host.removePrefix("www.").firstOrNull()?.uppercaseChar()?.toString() ?: "★"
+                } else if (bm.title.isNotBlank()) {
+                    bm.title.first().uppercaseChar().toString()
+                } else "★"
+                text = initial
+                textSize = 14f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                val d = (32 * resources.displayMetrics.density).toInt()
+                val lp = LinearLayout.LayoutParams(d, d).apply {
+                    rightMargin = (12 * resources.displayMetrics.density).toInt()
+                }
+                layoutParams = lp
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#0F766E"))
+                    cornerRadius = 16f
+                }
+            }
+            card.addView(iconBadge)
+
             val textCol = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -6019,7 +6129,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     bookmarks.removeAt(index)
                     saveBookmarks()
                     Toast.makeText(applicationContext, "Bookmark removed", Toast.LENGTH_SHORT).show()
-                    showBookmarks()
+                    showBookmarks(fromMenu = fromMenu)
                 }
             }
             card.addView(delBtn)
@@ -6073,12 +6183,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 themeMode = when (which) { 0 -> "dark"; 1 -> "light"; else -> "system" }
                 prefs.edit().putString("theme_mode", themeMode).commit()
                 d?.dismiss()
-                applyThemeInPlace()
+                applyThemeInPlace(showToast = true)
             }
             .show()
     }
 
-    private fun applyThemeInPlace() {
+    private fun applyThemeInPlace(showToast: Boolean = false) {
         try { tellHomePageTheme() } catch (_: Exception) {}
         val dark = isDarkNow()
         colBg = if (dark) Color.parseColor("#0E0E0E") else Color.parseColor("#FFFFFF")
@@ -6098,7 +6208,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         try { homeBtn.setTextColor(colText) } catch (_: Exception) {}
         try { webView.setBackgroundColor(colBg) } catch (_: Exception) {}
         try { renderTabs() } catch (_: Exception) {}
-        Toast.makeText(applicationContext, "Theme: " + themeModeLabel(), Toast.LENGTH_SHORT).show()
+        if (showToast) {
+            Toast.makeText(applicationContext, "Theme: " + themeModeLabel(), Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun copyCurrentLink() {
@@ -6531,7 +6643,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         syncPlaybackService()
     }
 
-    private fun showMusic() {
+    private fun showMusic(fromMenu: Boolean = true) {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(56, 36, 56, 20)
@@ -6543,8 +6655,6 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             setHintTextColor(Color.GRAY)
         }
         box.addView(input)
-        // v117: "use the music playing on this page" removed again.
-        // v104: local songs. A path typed by hand is not a link - pick it here.
         val addBtn = Button(this).apply {
             text = "+ Add a song from this phone"
             setOnClickListener {
@@ -6558,7 +6668,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             }
         }
         box.addView(addBtn)
-        AlertDialog.Builder(this)
+        val builder = AlertDialog.Builder(this)
             .setTitle("Music")
             .setView(box)
             .setPositiveButton("Play") { _, _ ->
@@ -6574,53 +6684,21 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 }
             }
             .setNeutralButton("Stop") { _, _ -> musicStop() }
-            .setNegativeButton("Close", null)
-            .show()
+        if (fromMenu) {
+            builder.setNegativeButton("Back") { _, _ -> showMenu() }
+            builder.setOnCancelListener { showMenu() }
+        } else {
+            builder.setNegativeButton("Close", null)
+        }
+        builder.show()
     }
 
-    private fun showSettings() {
+    // B2: Move "Edge glow" and "Background music" into a dedicated Music screen in Settings
+    private fun showMusicSettings(fromSettings: Boolean = true, originalFromMenu: Boolean = true) {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(56, 36, 56, 20)
         }
-        val autoHide = CheckBox(this).apply {
-            text = "Auto-hide the address bar (this tab)"
-            isChecked = autoHideBar
-            setTextColor(colText)
-            setPadding(0, 12, 0, 12)
-            setOnCheckedChangeListener { _, checked ->
-                // v68: the switch takes effect immediately - no reload needed.
-                autoHideBar = checked
-                prefs.edit().putBoolean("auto_hide_bar", checked).commit()
-                if (tabs.isNotEmpty()) {
-                    tabs[activeTab.coerceIn(0, tabs.size - 1)].autoHide = checked
-                }
-                if (checked) hideChrome() else showChrome()
-            }
-        }
-        val blockBox = CheckBox(this).apply {
-            text = "Block ads and trackers"
-            isChecked = adBlockEnabled
-            setTextColor(colText)
-            setPadding(0, 12, 0, 12)
-            setOnCheckedChangeListener { _, c ->
-                adBlockEnabled = c
-                prefs.edit().putBoolean("ad_block", c).commit()
-            }
-        }
-        val blockedInfo = TextView(this).apply {
-            text = "Blocked so far this session: " + blockedCount
-            setTextColor(colDim)
-            textSize = 12f
-            setPadding(0, 0, 0, 12)
-        }
-        val clearBtn = Button(this).apply {
-            text = "Clear cache now"
-            setOnClickListener { clearCacheNow() }
-        }
-
-        // --- v69/v73: the media switches. Each starts OFF and each shows a
-        // notice before it is switched on.
         val animBox = CheckBox(this).apply {
             text = "Edge glow while media plays"
             isChecked = musicAnimEnabled
@@ -6665,23 +6743,21 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                             "ends or you close the browser.",
                         onNo = { box.isChecked = false },
                         onYes = {
-                        bgMusicEnabled = true
-                        prefs.edit().putBoolean("bg_music", true).commit()
-                        applyVisibilityOverride()
-                        // Android 13+ hides the service notification without this.
-                        try {
-                            if (android.os.Build.VERSION.SDK_INT >= 33 &&
-                                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
-                                android.content.pm.PackageManager.PERMISSION_GRANTED
-                            ) {
-                                requestPermissions(
-                                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 4711
-                                )
-                            }
-                        } catch (_: Exception) {
+                            bgMusicEnabled = true
+                            prefs.edit().putBoolean("bg_music", true).commit()
+                            applyVisibilityOverride()
+                            try {
+                                if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    requestPermissions(
+                                        arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 4711
+                                    )
+                                }
+                            } catch (_: Exception) {}
+                            syncPlaybackService()
                         }
-                        syncPlaybackService()
-                    }
                     )
                 } else {
                     bgMusicEnabled = false
@@ -6691,7 +6767,59 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 }
             }
         }
+        box.addView(animBox)
+        box.addView(bgBox)
 
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Music Settings")
+            .setView(box)
+            .setPositiveButton("Done", null)
+        if (fromSettings) {
+            builder.setNegativeButton("Back") { _, _ -> showSettings(fromMenu = originalFromMenu) }
+            builder.setOnCancelListener { showSettings(fromMenu = originalFromMenu) }
+        }
+        builder.show()
+    }
+
+    private fun showSettings(fromMenu: Boolean = true) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(56, 36, 56, 20)
+        }
+        val autoHide = CheckBox(this).apply {
+            text = "Auto-hide the address bar (this tab)"
+            isChecked = autoHideBar
+            setTextColor(colText)
+            setPadding(0, 12, 0, 12)
+            setOnCheckedChangeListener { _, checked ->
+                autoHideBar = checked
+                prefs.edit().putBoolean("auto_hide_bar", checked).commit()
+                if (tabs.isNotEmpty()) {
+                    tabs[activeTab.coerceIn(0, tabs.size - 1)].autoHide = checked
+                }
+                if (checked) hideChrome() else showChrome()
+            }
+        }
+        val blockBox = CheckBox(this).apply {
+            text = "Block ads and trackers"
+            isChecked = adBlockEnabled
+            setTextColor(colText)
+            setPadding(0, 12, 0, 12)
+            setOnCheckedChangeListener { _, c ->
+                adBlockEnabled = c
+                prefs.edit().putBoolean("ad_block", c).commit()
+            }
+        }
+        val blockedInfo = TextView(this).apply {
+            text = "Blocked so far this session: " + blockedCount
+            setTextColor(colDim)
+            textSize = 12f
+            setPadding(0, 0, 0, 12)
+        }
+        val clearBtn = Button(this).apply {
+            text = "Clear cache now"
+            setOnClickListener { clearCacheNow() }
+        }
 
         val pullReloadBox = CheckBox(this).apply {
             text = "Pull down from top to hard reload"
@@ -6706,27 +6834,47 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
         box.addView(autoHide)
         box.addView(pullReloadBox)
-        box.addView(animBox)
-        // v146: your rules. Two entries, one for each list.
+
+        var settingsDlg: AlertDialog? = null
+
+        // B2: Dedicated Music row opening Music section
+        val musicBtn = Button(this).apply {
+            text = "Music (Edge glow & Background music) ›"
+            setTextColor(Color.CYAN)
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(0, 8, 0, 8)
+            setOnClickListener {
+                settingsDlg?.dismiss()
+                showMusicSettings(fromSettings = true, originalFromMenu = fromMenu)
+            }
+        }
+        box.addView(musicBtn)
+
         val myBlockBtn = Button(this).apply {
             text = "Sites I block  (" + userBlockHosts.size + ")"
             setTextColor(Color.CYAN)
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(0, 8, 0, 8)
-            setOnClickListener { showHostRuleEditor(true) }
+            setOnClickListener {
+                settingsDlg?.dismiss()
+                showHostRuleEditor(true, fromSettings = true, originalFromMenu = fromMenu)
+            }
         }
         val myAllowBtn = Button(this).apply {
             text = "Sites I allow  (" + userAllowHosts.size + ")"
             setTextColor(Color.CYAN)
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(0, 8, 0, 8)
-            setOnClickListener { showHostRuleEditor(false) }
+            setOnClickListener {
+                settingsDlg?.dismiss()
+                showHostRuleEditor(false, fromSettings = true, originalFromMenu = fromMenu)
+            }
         }
         box.addView(blockBox)
         box.addView(myBlockBtn)
         box.addView(myAllowBtn)
         box.addView(blockedInfo)
-        box.addView(bgBox)
+
         val themeBtn = Button(this).apply {
             text = "Theme: " + themeModeLabel() + "  (tap to change)"
             setOnClickListener { pickTheme() }
@@ -6757,11 +6905,16 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         }
         box.addView(bmInfo)
         box.addView(clearBm)
-        AlertDialog.Builder(this)
+
+        val builder = AlertDialog.Builder(this)
             .setTitle("Settings")
             .setView(box)
             .setPositiveButton("Done", null)
-            .show()
+        if (fromMenu) {
+            builder.setNegativeButton("Back") { _, _ -> showMenu() }
+            builder.setOnCancelListener { showMenu() }
+        }
+        settingsDlg = builder.show()
     }
 
     private fun clearCacheNow() {
@@ -6887,6 +7040,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     override fun onPause() {
         super.onPause()
         isAppInForeground = false
+        // Group C: Thumbnails are dropped when the app goes to the background
+        synchronized(tabThumbnails) {
+            tabThumbnails.clear()
+        }
         if (!bgMusicEnabled) {
             musicStop()
             stopPlaybackService()
@@ -6926,7 +7083,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             val mode = newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK
             if (mode != lastNightMode) {
                 lastNightMode = mode
-                applyThemeInPlace()
+                if (themeMode == "system") {
+                    applyThemeInPlace(showToast = false)
+                }
             }
         } catch (_: Exception) {}
     }
@@ -7006,6 +7165,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         stopPlaybackService()
         // v66: tabs live in memory only - drop them so nothing survives exit
         tabs.clear()
+        synchronized(tabThumbnails) { tabThumbnails.clear() }
         closeBlobStream()
         try { popupCaptureWebView?.destroy() } catch (_: Exception) {}
         popupCaptureWebView = null

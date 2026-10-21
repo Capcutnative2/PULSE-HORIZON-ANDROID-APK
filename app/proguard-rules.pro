@@ -28,3 +28,13 @@
 -keepclassmembers class * {
     @android.webkit.JavascriptInterface <methods>;
 }
+
+# Preserve ZXing embedded and barcode classes
+-keep class com.journeyapps.barcodescanner.** { *; }
+-keep class com.google.zxing.** { *; }
+-dontwarn com.google.zxing.**
+-dontwarn com.journeyapps.barcodescanner.**
+
+# Preserve app classes and services
+-keep class com.example.** { *; }
+

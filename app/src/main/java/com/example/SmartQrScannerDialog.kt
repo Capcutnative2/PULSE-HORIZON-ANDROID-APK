@@ -200,6 +200,7 @@ class SmartQrScannerDialog(
                     // with their points mapped into view coordinates
                 }
             })
+            barcodeView.resume()
         } catch (_: Exception) {
             toast("Could not start the camera")
         }

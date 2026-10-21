@@ -832,7 +832,7 @@ window.lucide={icons:{"search": "<path d=\"m21 21-4.34-4.34\" /> <circle cx=\"11
       try {
         if (!list || !list.length) return;
         openTabs = list.map(function (t, i) {
-          return { id: i, title: t.title || 'New tab', url: t.url || '', active: !!t.active };
+          return { id: i, title: t.title || 'New tab', url: t.url || '', active: !!t.active, thumb: t.thumb || '' };
         });
         renderTabCards();
       } catch (e) {}
@@ -859,6 +859,10 @@ window.lucide={icons:{"search": "<path d=\"m21 21-4.34-4.34\" /> <circle cx=\"11
           window.location.href = 'pulse://tab/' + tabIndex;
         };
 
+        const previewHtml = tab.thumb ?
+          `<div class="w-full h-full rounded-lg overflow-hidden relative"><img src="${tab.thumb}" class="w-full h-full object-cover" alt="Tab preview"/></div>` :
+          `<i data-lucide="globe" class="w-6 h-6 text-cyan-500/60 mb-1"></i><span class="text-[10px] text-slate-400 truncate w-full">${tab.url}</span>`;
+
         card.innerHTML = `
           <!-- Card Header -->
           <div class="flex items-center justify-between">
@@ -871,10 +875,9 @@ window.lucide={icons:{"search": "<path d=\"m21 21-4.34-4.34\" /> <circle cx=\"11
             </button>
           </div>
 
-          <!-- Card Body Preview Placeholder -->
-          <div class="flex-1 my-2 bg-slate-950/80 rounded-xl border border-cyan-500/20 p-2 flex flex-col justify-center items-center text-center">
-            <i data-lucide="globe" class="w-6 h-6 text-cyan-500/60 mb-1"></i>
-            <span class="text-[10px] text-slate-400 truncate w-full">${tab.url}</span>
+          <!-- Card Body Preview -->
+          <div class="flex-1 my-2 bg-slate-950/80 rounded-xl border border-cyan-500/20 p-1 flex flex-col justify-center items-center text-center overflow-hidden">
+            ${previewHtml}
           </div>
 
           <!-- Card Footer -->
