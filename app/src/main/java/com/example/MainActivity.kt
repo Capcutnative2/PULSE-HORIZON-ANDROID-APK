@@ -626,18 +626,37 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         val mimeType: String
     )
 
+    private var musicInputView: EditText? = null
+    private var currentMusicUri: String = ""
+
     // v104: Music mode can now take a file from this phone, not just a link.
     private val musicFileLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             try {
+                val persisted = contentResolver.persistedUriPermissions
+                if (persisted.size >= 120) {
+                    for (p in persisted) {
+                        try {
+                            contentResolver.releasePersistableUriPermission(
+                                p.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
                 contentResolver.takePersistableUriPermission(
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
-            } catch (_: Exception) {
+            } catch (e: SecurityException) {
+                android.util.Log.w("PulseHorizon", "Persistable permission not granted for $uri: ${e.message}")
+            } catch (e: Exception) {
+                android.util.Log.w("PulseHorizon", "Failed to persist URI permission for $uri: ${e.message}")
             }
-            musicPlay(uri.toString(), 0L)
+            val uriStr = uri.toString()
+            currentMusicUri = uriStr
+            musicInputView?.setText(uriStr)
+            musicInputView?.setSelection(uriStr.length)
         }
     }
 
@@ -5500,9 +5519,13 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     if (musicDecoding) {
                         try { musicTrack?.pause() } catch (_: Exception) {}
                         musicPlaying = false
+                        mediaPlaying = false
                         updateEdgeGlow()
                     } else {
                         pausePageElement()
+                        musicPlaying = false
+                        mediaPlaying = false
+                        updateEdgeGlow()
                     }
                 }
             }
@@ -5615,7 +5638,6 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     musicPlaying = true
                     mediaPlaying = true
                 }
-                updateEdgeGlow()
             } else {
                 if (mediaPlaying) {
                     pausePageMedia()
@@ -5626,6 +5648,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     mediaPlaying = true
                 }
             }
+            updateEdgeGlow()
             if (isAppInForeground) {
                 postForegroundNotification()
             } else {
@@ -5882,12 +5905,23 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     }
 
     private fun updateEdgeGlow() {
-        // MUSIC ONLY. A video playing will not light the edges.
-        val show = musicAnimEnabled && musicPlaying
-        edgeViews.forEach { it.visibility = if (show) View.VISIBLE else View.GONE }
-        webView.removeCallbacks(glowRunnable)
-        if (show) {
-            webView.post(glowRunnable)
+        runOnUiThread {
+            // MUSIC ONLY. A video playing will not light the edges.
+            val show = musicAnimEnabled && musicPlaying
+            edgeViews.forEach { it.visibility = if (show) View.VISIBLE else View.GONE }
+            edgeWaveView?.let { wv ->
+                wv.visibility = if (show) View.VISIBLE else View.GONE
+                if (!show) {
+                    wv.invalidate()
+                }
+            }
+            webView.removeCallbacks(glowRunnable)
+            if (show) {
+                webView.post(glowRunnable)
+            } else {
+                beatLevel = 0f
+                PlaybackService.instance?.updateBeatLevel(0f)
+            }
         }
     }
 
@@ -6669,6 +6703,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         // cannot bring a cancelled thread back to life.
         musicJob?.cancelled = true
         musicJob = null
+        try { decoderThread?.interrupt() } catch (_: Exception) {}
         musicDecoding = false
         musicPlaying = false
         mediaPlaying = false
@@ -6688,7 +6723,12 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             hint = "Paste a music link (.mp3 .m4a .mp4)"
             setTextColor(colText)
             setHintTextColor(Color.GRAY)
+            if (currentMusicUri.isNotBlank()) {
+                setText(currentMusicUri)
+                setSelection(currentMusicUri.length)
+            }
         }
+        musicInputView = input
         box.addView(input)
         val addBtn = Button(this).apply {
             text = "+ Add a song from this phone"
@@ -6778,24 +6818,34 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             .setView(box)
             .setPositiveButton("Play") { _, _ ->
                 val u = input.text.toString().trim()
-                if (!u.startsWith("http")) {
+                if (u.isEmpty() || (!u.startsWith("http://") && !u.startsWith("https://") && !u.startsWith("content://") && !u.startsWith("file://"))) {
                     Toast.makeText(
                         applicationContext,
                         "That is not a link. Use + below to pick a song from this phone.",
                         Toast.LENGTH_LONG
                     ).show()
                 } else {
+                    currentMusicUri = u
                     musicPlay(u)
                 }
             }
             .setNeutralButton("Stop") { _, _ -> musicStop() }
         if (fromMenu) {
             builder.setNegativeButton("Back") { _, _ -> showMenu() }
-            builder.setOnCancelListener { showMenu() }
+            builder.setOnCancelListener {
+                if (musicInputView === input) musicInputView = null
+                showMenu()
+            }
         } else {
             builder.setNegativeButton("Close", null)
         }
-        builder.show()
+        val dialog = builder.create()
+        dialog.setOnDismissListener {
+            if (musicInputView === input) {
+                musicInputView = null
+            }
+        }
+        dialog.show()
     }
 
     // B2: Move "Edge glow" and "Background music" into a dedicated Music screen in Settings
