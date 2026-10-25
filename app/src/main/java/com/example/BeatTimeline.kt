@@ -81,10 +81,12 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
     private val beats = ArrayList<Beat>(4096)
 
     // ------------------------------------------------------------
-    // tempo lock
+    // tempo and onset tracking
     // ------------------------------------------------------------
     private var tempoLagHops = 0        // period of the beat, in hops
     private var phaseHops = 0           // which hop the beat lands on
+    private var tempoPeriodHops = 0f    // exact floating-point period to prevent drift
+    private var nextExpectedBeatHop = -1
     private var hopsSeen = 0
     private var lastBeatHop = -100000
 
@@ -168,11 +170,21 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
             mag[k] = sqrt(re[k] * re[k] + im[k] * im[k])
         }
 
-        // ---- spectral flux: only the RISES count, that is what an onset is ----
+        // ---- weighted spectral flux ----
+        // Emphasizes rhythmic low-end (sub-bass, kicks, bass 30-300 Hz) and mid transients,
+        // while attenuating high-frequency noise, hiss, and vocal sibilance (>3.5 kHz)
         var flux = 0f
         for (k in 0 until bins) {
             val d = mag[k] - prevMag[k]
-            if (d > 0f) flux += d
+            if (d > 0f) {
+                val weight = when {
+                    k <= 4 -> 3.5f   // ~0 - 340 Hz (kicks, 808s, bass drops)
+                    k <= 14 -> 2.0f  // ~340 - 1200 Hz (snare fundamental, toms, bassline)
+                    k <= 35 -> 1.0f  // ~1200 - 3000 Hz (claps, guitar strum attacks)
+                    else -> 0.25f    // > 3000 Hz (hi-hats, cymbals, air, sibilance)
+                }
+                flux += d * weight
+            }
             prevMag[k] = mag[k]
         }
 
@@ -191,8 +203,8 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
             lastCentroid = lastCentroid * 0.80f + c.coerceIn(0f, 1f) * 0.20f
         }
 
-        // ---- a slow mean, so the threshold follows the track ----
-        meanMag = meanMag * 0.995f + flux * 0.005f
+        // ---- adaptive mean tracking for robust novelty across genres ----
+        meanMag = meanMag * 0.992f + flux * 0.008f
         val novelty = flux / (meanMag + 1e-6f)
 
         pushEnvelope(novelty)
@@ -219,24 +231,31 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         return envelope[idx]
     }
 
+    private fun localEnvelopeMean(count: Int = 16): Float {
+        if (envelopeCount == 0) return 1f
+        val n = minOf(count, envelopeCount)
+        var sum = 0f
+        for (i in 0 until n) {
+            sum += envelopeAt(i)
+        }
+        return sum / n
+    }
+
     // ============================================================
-    // TEMPO AND PHASE - this is what stops beats being missed
+    // TEMPO AND PHASE - tracks tempo and locks phase
     // ============================================================
 
-    /**
-     * Onset detection answers "did something happen just now".
-     * This answers "where is the pulse" - which is the difference between
-     * catching the beat and catching it when it happens to be loud.
-     */
     private fun updateTempo() {
-        // wait for a few seconds of history before trusting anything
-        if (envelopeCount < sampleRate / hop * 3) return
+        // wait for at least 2.5 seconds of history
+        val minHistory = (sampleRate / hop * 2.5f).toInt()
+        if (envelopeCount < minHistory) return
 
-        // only re-estimate occasionally - it does not change every frame
+        // re-estimate periodically
         if (hopsSeen % 32 != 0) return
 
+        // Support wide tempo range: 45 BPM to 220 BPM
         val minLag = (sampleRate / hop * 60 / 220).coerceAtLeast(4)   // 220 bpm
-        val maxLag = (sampleRate / hop * 60 / 60).coerceAtMost(envelopeCount / 2)  // 60 bpm
+        val maxLag = (sampleRate / hop * 60 / 45).coerceAtMost(envelopeCount / 2)  // 45 bpm
         if (maxLag <= minLag) return
 
         var bestLag = tempoLagHops
@@ -246,7 +265,7 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         while (lag <= maxLag) {
             var s = 0f
             var n = 0
-            while (n < 400 && n + lag < envelopeCount) {
+            while (n < 450 && n + lag < envelopeCount) {
                 s += envelopeAt(n) * envelopeAt(n + lag)
                 n++
             }
@@ -257,14 +276,12 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
             lag++
         }
 
-        if (bestLag <= 0) return
-
-        // require a real peak, not noise
-        if (bestScore <= 0f) return
+        if (bestLag <= 0 || bestScore <= 0f) return
 
         tempoLagHops = bestLag
+        tempoPeriodHops = bestLag.toFloat()
 
-        // ---- phase: which hop in the period the beats land on ----
+        // ---- phase estimation ----
         var bestPhase = phaseHops
         var bestPhaseScore = -1f
         var p = 0
@@ -282,34 +299,52 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
             p++
         }
         phaseHops = bestPhase
+
+        if (nextExpectedBeatHop < hopsSeen) {
+            nextExpectedBeatHop = hopsSeen + bestLag
+        }
     }
 
     // ============================================================
-    // EMIT
+    // EMIT - ONSET-LOCKING + CONTINUOUS CARRIER CLOCK
     // ============================================================
 
     private fun maybeEmitBeat(novelty: Float) {
-        // before the tempo locks, fall back to plain onset detection so the
-        // visualiser still moves during the first couple of seconds
-        if (tempoLagHops <= 0) {
-            if (novelty > 1.8f && hopsSeen - lastBeatHop > 2) {
+        val isLocalPeak = novelty > envelopeAt(1) && novelty > envelopeAt(2)
+        val localMean = localEnvelopeMean(16)
+        val isOnset = isLocalPeak && novelty > (localMean * 1.30f).coerceAtLeast(0.35f)
+        val minInterval = if (tempoPeriodHops > 0f) (tempoPeriodHops * 0.45f).toInt() else 12
+
+        if (tempoPeriodHops <= 0f) {
+            // Before tempo lock: respond dynamically to detected onsets
+            if (isOnset && (hopsSeen - lastBeatHop >= minInterval)) {
                 emit(novelty)
                 lastBeatHop = hopsSeen
             }
             return
         }
 
-        // where in the period are we?
-        val posInPeriod = hopsSeen % tempoLagHops
-        if (posInPeriod != phaseHops) return
-        if (hopsSeen - lastBeatHop < tempoLagHops / 2) return
+        val window = (tempoPeriodHops * 0.25f).toInt().coerceAtLeast(2)
+        val distToExpected = hopsSeen - nextExpectedBeatHop
 
-        // the beat is predicted here. take the strength from the envelope at
-        // this moment, so every wave can be a different size - and if the
-        // beat is quiet, we STILL fire, which is the whole point
-        val local = maxOf(novelty, envelopeAt(0), envelopeAt(1), envelopeAt(2))
-        emit(local)
-        lastBeatHop = hopsSeen
+        if (abs(distToExpected) <= window && isOnset) {
+            // Real onset in expected window: lock directly onto true audio transient (0 ms drift)
+            val strength = maxOf(novelty, envelopeAt(0), envelopeAt(1))
+            emit(strength)
+            lastBeatHop = hopsSeen
+            nextExpectedBeatHop = (hopsSeen + tempoPeriodHops).toInt()
+        } else if (hopsSeen >= nextExpectedBeatHop && (hopsSeen - lastBeatHop >= minInterval)) {
+            // Predicted beat deadline reached: carries through quiet parts/sustained notes
+            val strength = maxOf(novelty, envelopeAt(0), envelopeAt(1), envelopeAt(2))
+            emit(strength)
+            lastBeatHop = hopsSeen
+            nextExpectedBeatHop = (hopsSeen + tempoPeriodHops).toInt()
+        } else if (isOnset && (novelty > localMean * 2.2f) && (hopsSeen - lastBeatHop >= minInterval)) {
+            // Prominent off-grid syncopation or tempo shift: adaptively align clock
+            emit(novelty)
+            lastBeatHop = hopsSeen
+            nextExpectedBeatHop = (hopsSeen + tempoPeriodHops).toInt()
+        }
     }
 
     private fun emit(strength: Float) {
@@ -344,6 +379,8 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         beats.clear()
         tempoLagHops = 0
         phaseHops = 0
+        tempoPeriodHops = 0f
+        nextExpectedBeatHop = -1
         hopsSeen = 0
         lastBeatHop = -100000
         meanMag = 0f

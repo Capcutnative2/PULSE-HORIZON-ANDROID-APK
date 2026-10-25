@@ -437,15 +437,9 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
         //   - it rides ON TOP of the swell, so the surface still expands as
         //     it did. This adds the tremor, it does not replace anything.
         //   - the LINE is untouched. xs/ys are computed without it, so the
-        //     straight line keeps its shape exactly.
-        // It was 1.30f and it dominated everything - it became the picture
-        // instead of an accent on it. A vibration should be felt, not fill
-        // the screen. 0.30f makes it a tremor on the surface.
-        // It was 1.30f and dominated the screen; I cut it to 0.30f and it
-        // vanished - a guess in each direction. 0.90f is a tremor you can
-        // see that still sits UNDER the swell instead of becoming it.
-        val tremor = baseThickness * 0.90f * windLevel *
-                     Math.sin(tremorPhase.toDouble()).toFloat()
+        // The 10.2 Hz tremor dominated the frame-to-frame motion and fought the beat.
+        // Surface motion is driven purely by the swell (rise), matching the music's beat.
+        val tremor = 0f
 
             var i = 0
             while (i < WAVE_N) {
@@ -674,12 +668,13 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 // swell still looks the same - it is only being told a
                 // better time.
                 val fromScore = launcher?.level() ?: 0f
-                val target = maxOf(fromScore, musicAmp)
+                val hasBeats = (timeline?.beatCount() ?: 0) > 0
+                val target = if (hasBeats) fromScore else musicAmp
                 beatLevel = if (target > beatLevel) target
                             else beatLevel * Math.pow(0.88, k.toDouble()).toFloat()
                 pulse = (0.35f + 0.65f * beatLevel).coerceIn(0.20f, 1f)
             } else {
-                glowBeatPhase = (glowBeatPhase + 0.08f) % 6.2831853f
+                glowBeatPhase = (glowBeatPhase + 0.08f * k) % 6.2831853f
                 val s = 0.5f + 0.5f * Math.sin(glowBeatPhase.toDouble()).toFloat()
                 val kick = Math.pow(s.toDouble(), 4.0).toFloat()
                 beatLevel = kick
