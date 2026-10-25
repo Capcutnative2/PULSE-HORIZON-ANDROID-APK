@@ -241,6 +241,74 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         return sum / n
     }
 
+    private var lastEnergyRatio = 1f
+
+    private data class EnergyRatio(val onEnergy: Float, val betweenEnergy: Float, val ratio: Float)
+
+    private fun findBestPhase(lag: Int): Int {
+        var bestP = 0
+        var bestScore = -1f
+        var p = 0
+        val maxN = minOf(envelopeCount, 600)
+        val w = (lag / 16).coerceIn(1, 2)
+        while (p < lag) {
+            var s = 0f
+            var n = p
+            while (n < maxN) {
+                var maxLocal = 0f
+                for (dw in -w..w) {
+                    val idx = n + dw
+                    if (idx in 0 until maxN) {
+                        val v = envelopeAt(idx)
+                        if (v > maxLocal) maxLocal = v
+                    }
+                }
+                s += maxLocal
+                n += lag
+            }
+            if (s > bestScore) {
+                bestScore = s
+                bestP = p
+            }
+            p++
+        }
+        return bestP
+    }
+
+    private fun measureEnergyRatio(lag: Int, phase: Int): EnergyRatio {
+        if (lag <= 0 || envelopeCount == 0) return EnergyRatio(0f, 0f, 1f)
+        val maxN = minOf(envelopeCount, 600)
+        if (maxN < lag) return EnergyRatio(0f, 0f, 1f)
+
+        val w = (lag / 12).coerceIn(1, 3)
+        var onSum = 0f
+        var onCount = 0
+        var betweenSum = 0f
+        var betweenCount = 0
+
+        var n = 0
+        while (n < maxN) {
+            val mod = (n - phase) % lag
+            val pos = if (mod < 0) mod + lag else mod
+            val distToBeat = minOf(pos, lag - pos)
+
+            val v = envelopeAt(n)
+            if (distToBeat <= w) {
+                onSum += v
+                onCount++
+            } else {
+                betweenSum += v
+                betweenCount++
+            }
+            n++
+        }
+
+        val avgOn = if (onCount > 0) onSum / onCount else 0f
+        val avgBetween = if (betweenCount > 0) betweenSum / betweenCount else 0f
+        val ratio = if (avgBetween > 1e-4f) avgOn / avgBetween else (avgOn / 1e-4f)
+        return EnergyRatio(avgOn, avgBetween, ratio)
+    }
+
     // ============================================================
     // TEMPO AND PHASE - tracks tempo and locks phase
     // ============================================================
@@ -255,7 +323,7 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
 
         // Support wide tempo range: 45 BPM to 220 BPM
         val minLag = (sampleRate / hop * 60 / 220).coerceAtLeast(4)   // 220 bpm
-        val maxLag = (sampleRate / hop * 60 / 45).coerceAtMost(envelopeCount / 2)  // 45 bpm
+        val maxLag = (sampleRate / hop * 60 / 45).coerceAtMost(envelopeCount - 30)  // 45 bpm
         if (maxLag <= minLag) return
 
         var bestLag = tempoLagHops
@@ -265,12 +333,14 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         while (lag <= maxLag) {
             var s = 0f
             var n = 0
-            while (n < 450 && n + lag < envelopeCount) {
+            val maxN = minOf(envelopeCount - lag, 600)
+            while (n < maxN) {
                 s += envelopeAt(n) * envelopeAt(n + lag)
                 n++
             }
-            if (s > bestScore) {
-                bestScore = s
+            val normScore = if (maxN > 0) s / maxN else 0f
+            if (normScore > bestScore) {
+                bestScore = normScore
                 bestLag = lag
             }
             lag++
@@ -278,31 +348,65 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
 
         if (bestLag <= 0 || bestScore <= 0f) return
 
-        tempoLagHops = bestLag
-        tempoPeriodHops = bestLag.toFloat()
+        val p1 = findBestPhase(bestLag)
+        val r1 = measureEnergyRatio(bestLag, p1)
 
-        // ---- phase estimation ----
-        var bestPhase = phaseHops
-        var bestPhaseScore = -1f
-        var p = 0
-        while (p < bestLag) {
-            var s = 0f
-            var n = p
-            while (n < envelopeCount) {
-                s += envelopeAt(n)
-                n += bestLag
-            }
-            if (s > bestPhaseScore) {
-                bestPhaseScore = s
-                bestPhase = p
-            }
-            p++
-        }
-        phaseHops = bestPhase
+        var chosenLag = bestLag
+        var chosenPhase = p1
+        var chosenRatio = r1
 
-        if (nextExpectedBeatHop < hopsSeen) {
-            nextExpectedBeatHop = hopsSeen + bestLag
+        // Octave Verification:
+        // The autocorrelation search can lock onto the half-beat (2x tempo) due to strong 8th-note
+        // off-beats, or onto double-period (0.5x tempo). We verify against the audio by measuring
+        // energy ON the beats vs BETWEEN the beats across octave candidates.
+        val doubleLag = bestLag * 2
+        if (doubleLag <= maxLag) {
+            val p2 = findBestPhase(doubleLag)
+            val r2 = measureEnergyRatio(doubleLag, p2)
+
+            if ((r2.ratio > chosenRatio.ratio * 1.10f || chosenRatio.ratio < 1.40f) &&
+                r2.ratio > chosenRatio.ratio && r2.onEnergy >= chosenRatio.onEnergy * 0.80f) {
+                chosenLag = doubleLag
+                chosenPhase = p2
+                chosenRatio = r2
+            }
         }
+
+        val halfLag = bestLag / 2
+        if (halfLag >= minLag) {
+            val pHalf = findBestPhase(halfLag)
+            val rHalf = measureEnergyRatio(halfLag, pHalf)
+
+            if ((rHalf.ratio > chosenRatio.ratio * 1.10f || chosenRatio.ratio < 1.40f) &&
+                rHalf.ratio > chosenRatio.ratio && rHalf.onEnergy >= chosenRatio.onEnergy * 0.80f) {
+                chosenLag = halfLag
+                chosenPhase = pHalf
+                chosenRatio = rHalf
+            }
+        }
+
+        lastEnergyRatio = chosenRatio.ratio
+
+        // Honest handling: If there is NO clear beat (ambient, classical, free jazz),
+        // the on/off ratio never gets high (< 1.40). DO NOT INVENT A BEAT.
+        // Fall back to loudness/onset reaction.
+        if (chosenRatio.ratio < 1.40f) {
+            tempoLagHops = 0
+            tempoPeriodHops = 0f
+            phaseHops = 0
+            return
+        }
+
+        tempoLagHops = chosenLag
+        tempoPeriodHops = chosenLag.toFloat()
+        phaseHops = chosenPhase
+
+        // Align next expected beat with the measured phase
+        var nextHop = hopsSeen + (chosenLag - chosenPhase % chosenLag)
+        while (nextHop <= hopsSeen) {
+            nextHop += chosenLag
+        }
+        nextExpectedBeatHop = nextHop
     }
 
     // ============================================================
@@ -371,6 +475,18 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         return out
     }
 
+    /** Current locked BPM, or 0f if not locked / no clear beat */
+    fun currentBpm(): Float {
+        if (tempoPeriodHops <= 0f) return 0f
+        return (sampleRate.toFloat() / hop * 60f) / tempoPeriodHops
+    }
+
+    /** Ratio of energy on the beats vs between the beats */
+    fun currentEnergyRatio(): Float = lastEnergyRatio
+
+    /** Whether tempo has locked onto a periodic beat grid */
+    fun tempoLocked(): Boolean = tempoPeriodHops > 0f
+
     fun reset() {
         envelopeCount = 0
         envelopeWrite = 0
@@ -385,6 +501,7 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         lastBeatHop = -100000
         meanMag = 0f
         lastCentroid = 0.5f
+        lastEnergyRatio = 1f
         for (k in 0 until bins) prevMag[k] = 0f
     }
 
