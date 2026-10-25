@@ -47,17 +47,12 @@ class WaveLauncher(private val sampleRate: Int) {
         var colour = 0.5f      // 0 = dark hit, 1 = bright hit - from the score
         var alive = false
 
-        /** 0 at birth, 1 at the peak, back down to 0 as it dies. */
+        /** 1 at birth (on the beat), falling to 0 as it dies. */
         fun envelope(): Float {
             if (!alive) return 0f
             val t = (age / life).coerceIn(0f, 1f)
-            // rise fast, fall slow - that is what makes it read as water
-            return if (t < 0.18f) {
-                (t / 0.18f)
-            } else {
-                val f = (t - 0.18f) / 0.82f
-                (1f - f) * (1f - f)
-            }
+            val f = 1f - t
+            return f * f
         }
     }
 
