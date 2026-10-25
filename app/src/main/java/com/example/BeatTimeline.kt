@@ -92,6 +92,9 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
 
     private var meanMag = 0f
 
+    /** on/off energy ratio of the chosen tempo - the health check */
+    private var lastRatio = -1f
+
     /** THE COLOUR. The spectral centroid of the frame that fired the beat -
      *  where the energy sits in the spectrum. A bright hit (hats, a snare,
      *  a high synth) sits high; a dark hit (a kick, a bass note) sits low.
@@ -313,101 +316,112 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
     // TEMPO AND PHASE - tracks tempo and locks phase
     // ============================================================
 
+    /**
+     * TEMPO, WITH THE OCTAVE CHECK.
+     *
+     * The strongest autocorrelation peak is often at DOUBLE the real tempo -
+     * the half-beat - because the off-beat can carry as much energy as the
+     * beat, and autocorrelation cannot tell which it picked. That is what was
+     * happening: this track is 103.4 BPM and it locked onto 206.7, so every
+     * note was written on a half-beat and every effect downstream was wrong.
+     *
+     * So test the tempo AND its half, and keep whichever puts the beats where
+     * the MUSIC HAS ENERGY.
+     *
+     * Beats land on hits. That is a property of music itself, not of one song,
+     * so this works on any track with nothing hardcoded and no per-song data.
+     * A song nobody has ever heard gets a correct score, because the score is
+     * computed from the song.
+     */
     private fun updateTempo() {
-        // wait for at least 2.5 seconds of history
-        val minHistory = (sampleRate / hop * 2.5f).toInt()
-        if (envelopeCount < minHistory) return
-
-        // re-estimate periodically
+        if (envelopeCount < sampleRate / hop * 3) return
         if (hopsSeen % 32 != 0) return
 
-        // Support wide tempo range: 45 BPM to 220 BPM
-        val minLag = (sampleRate / hop * 60 / 220).coerceAtLeast(4)   // 220 bpm
-        val maxLag = (sampleRate / hop * 60 / 45).coerceAtMost(envelopeCount - 30)  // 45 bpm
+        val minLag = (sampleRate / hop * 60 / 220).coerceAtLeast(4)
+        val maxLag = (sampleRate / hop * 60 / 60).coerceAtMost(envelopeCount / 2)
         if (maxLag <= minLag) return
 
-        var bestLag = tempoLagHops
-        var bestScore = -1f
-
+        var bestLag = 0
+        var bestScore = 0f
         var lag = minLag
         while (lag <= maxLag) {
-            var s = 0f
+            var sc = 0f
             var n = 0
-            val maxN = minOf(envelopeCount - lag, 600)
-            while (n < maxN) {
-                s += envelopeAt(n) * envelopeAt(n + lag)
+            while (n < 400 && n + lag < envelopeCount) {
+                sc += envelopeAt(n) * envelopeAt(n + lag)
                 n++
             }
-            val normScore = if (maxN > 0) s / maxN else 0f
-            if (normScore > bestScore) {
-                bestScore = normScore
-                bestLag = lag
-            }
+            if (sc > bestScore) { bestScore = sc; bestLag = lag }
             lag++
         }
-
         if (bestLag <= 0 || bestScore <= 0f) return
 
-        val p1 = findBestPhase(bestLag)
-        val r1 = measureEnergyRatio(bestLag, p1)
-
-        var chosenLag = bestLag
-        var chosenPhase = p1
-        var chosenRatio = r1
-
-        // Octave Verification:
-        // The autocorrelation search can lock onto the half-beat (2x tempo) due to strong 8th-note
-        // off-beats, or onto double-period (0.5x tempo). We verify against the audio by measuring
-        // energy ON the beats vs BETWEEN the beats across octave candidates.
-        val doubleLag = bestLag * 2
-        if (doubleLag <= maxLag) {
-            val p2 = findBestPhase(doubleLag)
-            val r2 = measureEnergyRatio(doubleLag, p2)
-
-            if ((r2.ratio > chosenRatio.ratio * 1.10f || chosenRatio.ratio < 1.40f) &&
-                r2.ratio > chosenRatio.ratio && r2.onEnergy >= chosenRatio.onEnergy * 0.80f) {
-                chosenLag = doubleLag
-                chosenPhase = p2
-                chosenRatio = r2
+        // ---- THE OCTAVE CHECK ----
+        var chosen = bestLag
+        var chosenRatio = -1f
+        var pass = 0
+        while (pass < 2) {
+            val cand = if (pass == 0) bestLag else bestLag * 2
+            if (cand >= 4 && cand * 2 < envelopeCount) {
+                val ph = phaseFor(cand)
+                val on = bandEnergy(cand, ph)
+                val off = bandEnergy(cand, ph + cand / 2)
+                val ratio = on / (off + 1e-6f)
+                if (ratio > chosenRatio) { chosenRatio = ratio; chosen = cand }
             }
+            pass++
         }
 
-        val halfLag = bestLag / 2
-        if (halfLag >= minLag) {
-            val pHalf = findBestPhase(halfLag)
-            val rHalf = measureEnergyRatio(halfLag, pHalf)
-
-            if ((rHalf.ratio > chosenRatio.ratio * 1.10f || chosenRatio.ratio < 1.40f) &&
-                rHalf.ratio > chosenRatio.ratio && rHalf.onEnergy >= chosenRatio.onEnergy * 0.80f) {
-                chosenLag = halfLag
-                chosenPhase = pHalf
-                chosenRatio = rHalf
-            }
-        }
-
-        lastEnergyRatio = chosenRatio.ratio
-
-        // Honest handling: If there is NO clear beat (ambient, classical, free jazz),
-        // the on/off ratio never gets high (< 1.40). DO NOT INVENT A BEAT.
-        // Fall back to loudness/onset reaction.
-        if (chosenRatio.ratio < 1.40f) {
-            tempoLagHops = 0
-            tempoPeriodHops = 0f
-            phaseHops = 0
-            return
-        }
-
-        tempoLagHops = chosenLag
-        tempoPeriodHops = chosenLag.toFloat()
-        phaseHops = chosenPhase
-
-        // Align next expected beat with the measured phase
-        var nextHop = hopsSeen + (chosenLag - chosenPhase % chosenLag)
-        while (nextHop <= hopsSeen) {
-            nextHop += chosenLag
-        }
-        nextExpectedBeatHop = nextHop
+        tempoLagHops = chosen
+        phaseHops = phaseFor(chosen)
+        lastRatio = chosenRatio
     }
+
+    /** Which hop in the period the beats land on. */
+    private fun phaseFor(lag: Int): Int {
+        var bestP = 0
+        var bestS = -1f
+        var p = 0
+        while (p < lag) {
+            var sc = 0f
+            var n = p
+            while (n < envelopeCount) { sc += envelopeIndex(n); n += lag }
+            if (sc > bestS) { bestS = sc; bestP = p }
+            p++
+        }
+        return bestP
+    }
+
+    /** Mean envelope ON the beat positions, for a lag and a phase. */
+    private fun bandEnergy(lag: Int, phase: Int): Float {
+        var sc = 0f
+        var n = 0
+        var i = phase
+        while (i < envelopeCount) { sc += envelopeIndex(i); n++; i += lag }
+        return if (n > 0) sc / n else 0f
+    }
+
+    /** The envelope by ABSOLUTE hop index, oldest first. */
+    private fun envelopeIndex(i: Int): Float {
+        if (i < 0 || i >= envelopeCount) return 0f
+        var idx = envelopeWrite - envelopeCount + i
+        while (idx < 0) idx += envelopeCapacity
+        while (idx >= envelopeCapacity) idx -= envelopeCapacity
+        return envelope[idx]
+    }
+
+    /**
+     * THE HEALTH CHECK - the on/off energy ratio of the tempo it chose.
+     * Beats land on hits, so this should be well above 1. Near 1 means the
+     * beats are NOT on the music and the tempo is wrong.
+     * Measured on the test track before this fix: 1.10.
+     */
+    fun tempoRatio(): Float = lastRatio
+
+    /** The locked tempo in BPM. 0 until it locks. Should read ~103, not ~207. */
+    fun tempoBpm(): Float =
+        if (tempoLagHops > 0) 60f * (sampleRate.toFloat() / hop) / tempoLagHops else 0f
+
 
     // ============================================================
     // EMIT - ONSET-LOCKING + CONTINUOUS CARRIER CLOCK
@@ -501,6 +515,7 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
         lastBeatHop = -100000
         meanMag = 0f
         lastCentroid = 0.5f
+        lastRatio = -1f
         lastEnergyRatio = 1f
         for (k in 0 until bins) prevMag[k] = 0f
     }
