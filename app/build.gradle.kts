@@ -7,7 +7,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.pulsehorizon.browser"
+        applicationId = "com.aistudio.pulsehorizon.a8k9m2"
         minSdk = 26
         targetSdk = 35
         versionCode = 6

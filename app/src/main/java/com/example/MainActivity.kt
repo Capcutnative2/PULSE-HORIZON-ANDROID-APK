@@ -631,56 +631,26 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
     private val glowRunnable = object : Runnable {
         override fun run() {
-            if (!musicPlaying) return
+            if (!musicPlaying && !musicDecoding && diskVisualizerOverlay == null) return
 
-            // STEP 2b-iii: TIME-BASED, NOT TICK-BASED. Every step below is a
-            // fixed amount PER TICK, written when this ran at 30 Hz. Moving it
-            // to the frame callback made it run 60 times a second, so each
-            // step advanced twice as much. k is how much time this tick
-            // really represents, in units of the old 33 ms: 1.0 at 30 Hz,
-            // 0.5 at 60 Hz. The animation therefore runs at exactly the speed
-            // it always did, at any frame rate.
             val nowNs = System.nanoTime()
             val dtSec = if (lastGlowTickNs == 0L) 0.033f
                         else ((nowNs - lastGlowTickNs) / 1000000000.0).toFloat().coerceIn(0.001f, 0.1f)
             lastGlowTickNs = nowNs
             val k = dtSec / 0.033f
 
-            // WIRE B. The launcher reads the score and fires waves when the
-            // audio output reaches each beat. getPlaybackHeadPosition() is
-            // what the SPEAKER is playing now - not what the decoder has
-            // read - which is the whole point.
-            //
-            // NOTHING BELOW USES THE RESULT YET. beatLevel still comes from
-            // musicAmp, exactly as before. This only proves the waves are
-            // being launched.
             launcher?.setTimeline(timeline?.all() ?: emptyList())
             launcher?.advance((musicTrack?.getPlaybackHeadPosition() ?: 0).toLong(), dtSec)
-            android.util.Log.d("PH", "bpm=" + timeline?.tempoBpm() + " ratio=" + timeline?.tempoRatio())
 
             val pulse: Float
-            if (musicDecoding) {
-                // WIRE C: THE DRAWING READS THE SCORE.
-                //
-                // THE BLEND, and both halves matter:
-                //   - musicAmp is always there, so the glow reacts from the
-                //     very first moment. No dead zone while the tempo locks
-                //     (which takes about three seconds).
-                //   - launcher.level() is the score: the strongest wave
-                //     alive, which came from a beat POSITION, not a buffer
-                //     average. It takes over as soon as the timeline locks.
-                //
-                // The hold-and-decay is unchanged: rise instantly to the
-                // target, fall away by the same curve as before. So the
-                // swell still looks the same - it is only being told a
-                // better time.
+            if (musicDecoding || diskVisualizerOverlay != null) {
                 val fromScore = launcher?.level() ?: 0f
                 val target = maxOf(fromScore, musicAmp)
                 beatLevel = if (target > beatLevel) target
-                            else beatLevel * Math.pow(0.88, k.toDouble()).toFloat()
+                            else beatLevel * Math.pow(0.70, k.toDouble()).toFloat()
                 pulse = (0.35f + 0.65f * beatLevel).coerceIn(0.20f, 1f)
             } else {
-                glowBeatPhase = (glowBeatPhase + 0.08f) % 6.2831853f
+                glowBeatPhase = (glowBeatPhase + 0.08f * k) % 6.2831853f
                 val s = 0.5f + 0.5f * Math.sin(glowBeatPhase.toDouble()).toFloat()
                 val kick = Math.pow(s.toDouble(), 4.0).toFloat()
                 beatLevel = kick
@@ -760,28 +730,14 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
 
     // v104: Music mode can now take a file from this phone, not just a link.
     private val musicFileLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
+        ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) {
             try {
-                val persisted = contentResolver.persistedUriPermissions
-                if (persisted.size >= 120) {
-                    for (p in persisted) {
-                        try {
-                            contentResolver.releasePersistableUriPermission(
-                                p.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
-                            )
-                        } catch (_: Exception) {}
-                    }
-                }
                 contentResolver.takePersistableUriPermission(
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
-            } catch (e: SecurityException) {
-                android.util.Log.w("PulseHorizon", "Persistable permission not granted for $uri: ${e.message}")
-            } catch (e: Exception) {
-                android.util.Log.w("PulseHorizon", "Failed to persist URI permission for $uri: ${e.message}")
-            }
+            } catch (_: Exception) {}
             val uriStr = uri.toString()
             currentMusicUri = uriStr
             musicInputView?.setText(uriStr)
@@ -792,7 +748,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     private var diskVisualizerOverlay: DiskVisualizerOverlay? = null
 
     private val visSongLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
+        ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) {
             try {
@@ -808,7 +764,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     }
 
     private val visLogoLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
+        ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) {
             try {
@@ -6482,7 +6438,22 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                     }
                     ex.setDataSource(this@MainActivity, Uri.parse(url), headers)
                 } else {
-                    ex.setDataSource(this@MainActivity, Uri.parse(url), null)
+                    val uri = Uri.parse(url)
+                    if (uri.scheme == "content" || uri.scheme == "file") {
+                        try {
+                            val pfd = contentResolver.openFileDescriptor(uri, "r")
+                            if (pfd != null) {
+                                ex.setDataSource(pfd.fileDescriptor)
+                                pfd.close()
+                            } else {
+                                ex.setDataSource(this@MainActivity, uri, null)
+                            }
+                        } catch (_: Exception) {
+                            ex.setDataSource(this@MainActivity, uri, null)
+                        }
+                    } else {
+                        ex.setDataSource(this@MainActivity, uri, null)
+                    }
                 }
                 extractor = ex
                 var idx = -1
@@ -6671,14 +6642,14 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                                 while (j + 1 < writeOffset + writeLength) {
                                     val lo = bytes[j].toInt() and 0xFF
                                     val hi = bytes[j + 1].toInt()
-                                    val sample = (hi shl 8) or lo
+                                    val sample = ((hi shl 8) or lo).toShort().toInt()
                                     val a = if (sample < 0) -sample else sample
                                     sum += a
                                     count++
                                     j += 2
                                 }
                                 val mean = if (count > 0) sum.toFloat() / count else 0f
-                                musicAmp = (mean / 32768f * 4f).coerceIn(0f, 1f)
+                                musicAmp = (mean / 32768f * 4.5f).coerceIn(0f, 1f)
                             }
                         }
                         c.releaseOutputBuffer(outIx, false)
@@ -6901,7 +6872,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             text = "+ Add a song from this phone"
             setOnClickListener {
                 try {
-                    musicFileLauncher.launch(arrayOf("audio/*"))
+                    musicFileLauncher.launch("audio/*")
                 } catch (_: Exception) {
                     Toast.makeText(
                         applicationContext, "No file picker found", Toast.LENGTH_SHORT
@@ -7047,7 +7018,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             text = "+ Pick music from phone to visualize"
             setOnClickListener {
                 try {
-                    visSongLauncher.launch(arrayOf("audio/*"))
+                    visSongLauncher.launch("audio/*")
                 } catch (_: Exception) {
                     Toast.makeText(applicationContext, "No file picker found", Toast.LENGTH_SHORT).show()
                 }
@@ -7081,19 +7052,25 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     }
 
     private fun showDiskVisualizerOverlay(audioUri: Uri? = null) {
-        if (diskVisualizerOverlay != null) return
+        if (diskVisualizerOverlay != null) {
+            if (audioUri != null) {
+                currentMusicUri = audioUri.toString()
+                musicPlay(currentMusicUri)
+            }
+            return
+        }
         val overlay = DiskVisualizerOverlay(
             activity = this,
             onPickSong = {
                 try {
-                    visSongLauncher.launch(arrayOf("audio/*"))
+                    visSongLauncher.launch("audio/*")
                 } catch (_: Exception) {
                     Toast.makeText(applicationContext, "No file picker found", Toast.LENGTH_SHORT).show()
                 }
             },
             onPickLogo = {
                 try {
-                    visLogoLauncher.launch(arrayOf("image/*"))
+                    visLogoLauncher.launch("image/*")
                 } catch (_: Exception) {
                     Toast.makeText(applicationContext, "No file picker found", Toast.LENGTH_SHORT).show()
                 }
@@ -7119,6 +7096,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
+        updateEdgeGlow()
     }
 
     private fun closeDiskVisualizerOverlay() {

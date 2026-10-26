@@ -81,7 +81,21 @@ class DiskVisualizerExporter(private val context: Context) {
 
         // Extract audio duration
         val audioExtractor = MediaExtractor()
-        audioExtractor.setDataSource(context, audioUri, null)
+        if (audioUri.scheme == "content" || audioUri.scheme == "file") {
+            try {
+                val pfd = context.contentResolver.openFileDescriptor(audioUri, "r")
+                if (pfd != null) {
+                    audioExtractor.setDataSource(pfd.fileDescriptor)
+                    pfd.close()
+                } else {
+                    audioExtractor.setDataSource(context, audioUri, null)
+                }
+            } catch (_: Exception) {
+                audioExtractor.setDataSource(context, audioUri, null)
+            }
+        } else {
+            audioExtractor.setDataSource(context, audioUri, null)
+        }
         var audioTrackIndex = -1
         var audioFormat: MediaFormat? = null
         for (i in 0 until audioExtractor.trackCount) {
