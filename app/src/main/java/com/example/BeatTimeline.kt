@@ -358,23 +358,33 @@ class BeatTimeline(private val sampleRate: Int, private val channels: Int = 1) {
 
         // ---- THE OCTAVE CHECK ----
         var chosen = bestLag
-        var chosenRatio = -1f
-        var pass = 0
-        while (pass < 2) {
-            val cand = if (pass == 0) bestLag else bestLag * 2
-            if (cand >= 4 && cand * 2 < envelopeCount) {
-                val ph = phaseFor(cand)
-                val on = bandEnergy(cand, ph)
-                val off = bandEnergy(cand, ph + cand / 2)
-                val ratio = on / (off + 1e-6f)
-                if (ratio > chosenRatio) { chosenRatio = ratio; chosen = cand }
+        var chosenPhase = findBestPhase(bestLag)
+        var chosenER = measureEnergyRatio(bestLag, chosenPhase)
+
+        val doubleLag = bestLag * 2
+        if (doubleLag in minLag..maxLag && doubleLag < envelopeCount) {
+            val ph2 = findBestPhase(doubleLag)
+            val er2 = measureEnergyRatio(doubleLag, ph2)
+            if (er2.ratio > chosenER.ratio) {
+                chosen = doubleLag
+                chosenPhase = ph2
+                chosenER = er2
             }
-            pass++
         }
 
         tempoLagHops = chosen
-        phaseHops = phaseFor(chosen)
-        lastRatio = chosenRatio
+        phaseHops = chosenPhase
+        lastRatio = chosenER.ratio
+        lastEnergyRatio = chosenER.ratio
+
+        if (chosenER.ratio >= 1.50f) {
+            tempoPeriodHops = chosen.toFloat()
+            if (nextExpectedBeatHop < 0) {
+                nextExpectedBeatHop = (hopsSeen + tempoPeriodHops).toInt()
+            }
+        } else {
+            tempoPeriodHops = 0f
+        }
     }
 
     /** Which hop in the period the beats land on. */
