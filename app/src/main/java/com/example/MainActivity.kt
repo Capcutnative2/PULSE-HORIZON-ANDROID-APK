@@ -656,6 +656,7 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             // being launched.
             launcher?.setTimeline(timeline?.all() ?: emptyList())
             launcher?.advance((musicTrack?.getPlaybackHeadPosition() ?: 0).toLong(), dtSec)
+            android.util.Log.d("PH", "bpm=" + timeline?.tempoBpm() + " ratio=" + timeline?.tempoRatio())
 
             val pulse: Float
             if (musicDecoding) {
@@ -689,6 +690,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             if (musicAnimEnabled) {
                 edgeWaveView?.timeScale = k
                 edgeWaveView?.updateWave(beatLevel, pulse)
+            }
+            diskVisualizerOverlay?.visualizerView?.let { dv ->
+                dv.timeScale = k
+                dv.updateWave(beatLevel, pulse)
             }
             // v104: Keep notification live level meter in sync with the exact same beat
             PlaybackService.instance?.updateBeatLevel(beatLevel)
@@ -781,6 +786,37 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             currentMusicUri = uriStr
             musicInputView?.setText(uriStr)
             musicInputView?.setSelection(uriStr.length)
+        }
+    }
+
+    private var diskVisualizerOverlay: DiskVisualizerOverlay? = null
+
+    private val visSongLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            val uriStr = uri.toString()
+            currentMusicUri = uriStr
+            musicPlay(uriStr)
+            showDiskVisualizerOverlay(uri)
+        }
+    }
+
+    private val visLogoLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            diskVisualizerOverlay?.setLogoFromUri(uri)
         }
     }
 
@@ -6874,6 +6910,19 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             }
         }
         box.addView(addBtn)
+        var musicDialogRef: AlertDialog? = null
+        val visBtn = Button(this).apply {
+            text = "Visualization 🎵"
+            setOnClickListener {
+                musicDialogRef?.dismiss()
+                showVisualizationMenu(fromMenu = fromMenu)
+            }
+        }
+        val visLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = 8 }
+        box.addView(visBtn, visLp)
         val animBox = CheckBox(this).apply {
             text = "Edge glow while media plays"
             isChecked = musicAnimEnabled
@@ -6971,12 +7020,145 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
             builder.setNegativeButton("Close", null)
         }
         val dialog = builder.create()
+        musicDialogRef = dialog
         dialog.setOnDismissListener {
             if (musicInputView === input) {
                 musicInputView = null
             }
         }
         dialog.show()
+    }
+
+    private fun showVisualizationMenu(fromMenu: Boolean = true) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(56, 36, 56, 20)
+        }
+        val desc = TextView(this).apply {
+            text = "Pulse Horizon Disk Visualiser\nWaves ripple around the rim in real-time."
+            setTextColor(colText)
+            setPadding(0, 0, 0, 24)
+            textSize = 14f
+        }
+        box.addView(desc)
+
+        // The + is a LOCAL FILE GRAB: user picks music file from phone, and that is what the visualizer plays!
+        val grabBtn = Button(this).apply {
+            text = "+ Pick music from phone to visualize"
+            setOnClickListener {
+                try {
+                    visSongLauncher.launch(arrayOf("audio/*"))
+                } catch (_: Exception) {
+                    Toast.makeText(applicationContext, "No file picker found", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        box.addView(grabBtn)
+
+        if (currentMusicUri.isNotBlank()) {
+            val playCurrentBtn = Button(this).apply {
+                text = "▶ Start Visualiser with current song"
+                setOnClickListener {
+                    if (!musicPlaying) {
+                        musicPlay(currentMusicUri)
+                    }
+                    showDiskVisualizerOverlay(Uri.parse(currentMusicUri))
+                }
+            }
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 16 }
+            box.addView(playCurrentBtn, lp)
+        }
+
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Visualization")
+            .setView(box)
+            .setNegativeButton("Back") { _, _ -> showMusic(fromMenu = fromMenu) }
+        val d = builder.create()
+        d.show()
+    }
+
+    private fun showDiskVisualizerOverlay(audioUri: Uri? = null) {
+        if (diskVisualizerOverlay != null) return
+        val overlay = DiskVisualizerOverlay(
+            activity = this,
+            onPickSong = {
+                try {
+                    visSongLauncher.launch(arrayOf("audio/*"))
+                } catch (_: Exception) {
+                    Toast.makeText(applicationContext, "No file picker found", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onPickLogo = {
+                try {
+                    visLogoLauncher.launch(arrayOf("image/*"))
+                } catch (_: Exception) {
+                    Toast.makeText(applicationContext, "No file picker found", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onExportMp4 = {
+                val u = audioUri ?: if (currentMusicUri.isNotBlank()) Uri.parse(currentMusicUri) else null
+                if (u == null) {
+                    Toast.makeText(applicationContext, "Please pick a song first", Toast.LENGTH_SHORT).show()
+                } else {
+                    startDiskExport(u)
+                }
+            },
+            onClose = {
+                closeDiskVisualizerOverlay()
+            }
+        )
+        diskVisualizerOverlay = overlay
+        val targetLayer = glowLayerRef ?: findViewById<FrameLayout>(android.R.id.content)
+        targetLayer?.addView(
+            overlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+    }
+
+    private fun closeDiskVisualizerOverlay() {
+        val overlay = diskVisualizerOverlay ?: return
+        diskVisualizerOverlay = null
+        (overlay.parent as? ViewGroup)?.removeView(overlay)
+    }
+
+    private fun startDiskExport(audioUri: Uri) {
+        val overlay = diskVisualizerOverlay ?: return
+        val progressDialog = AlertDialog.Builder(this)
+            .setTitle("Exporting MP4 Visualisation...")
+            .setMessage("Rendering frames and muxing audio: 0%")
+            .setCancelable(false)
+            .create()
+        progressDialog.show()
+
+        val exporter = DiskVisualizerExporter(this)
+        exporter.export(
+            audioUri = audioUri,
+            mode = overlay.visualizerView.mode,
+            customColor = overlay.visualizerView.customColor,
+            vibrationScale = overlay.visualizerView.vibrationMultiplier,
+            logoBitmap = overlay.visualizerView.logoBitmap,
+            onProgress = { pct ->
+                progressDialog.setMessage("Rendering frames and muxing audio: $pct%")
+            },
+            onComplete = { file ->
+                progressDialog.dismiss()
+                Toast.makeText(
+                    applicationContext,
+                    "Saved to Movies: ${file.name}",
+                    Toast.LENGTH_LONG
+                ).show()
+            },
+            onError = { err ->
+                progressDialog.dismiss()
+                Toast.makeText(applicationContext, "Export failed: $err", Toast.LENGTH_LONG).show()
+            }
+        )
     }
 
     // B2: Move "Edge glow" and "Background music" into a dedicated Music screen in Settings
@@ -7415,6 +7597,10 @@ class MainActivity : ComponentActivity(), ComponentCallbacks2 {
     }
 
     override fun onBackPressed() {
+        if (diskVisualizerOverlay != null) {
+            closeDiskVisualizerOverlay()
+            return
+        }
         if (webView.canGoBack()) {
             webView.goBack()
         } else {

@@ -172,4 +172,15 @@ class ExampleUnitTest {
     // Must NOT invent a phantom beat: tempoLocked must be false
     assertFalse("Ambient track should not lock onto a phantom beat (bpm=$bpm, ratio=$ratio)", timeline.tempoLocked())
   }
+
+  @Test
+  fun testDiskVisualizerViewModeEnum() {
+    // Mode 1: Disk
+    val mode1 = DiskVisualizerView.Mode.DISK
+    assertEquals("DISK", mode1.name)
+
+    // Mode 2: Disk + Edge
+    val mode2 = DiskVisualizerView.Mode.DISK_AND_EDGE
+    assertEquals("DISK_AND_EDGE", mode2.name)
+  }
 }
